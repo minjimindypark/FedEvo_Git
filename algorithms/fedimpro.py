@@ -94,7 +94,8 @@ class FedImproRunner(BaseRunner):
         else:
             # Fallback: use penultimate layer output
             # This is a placeholder - actual implementation depends on architecture
-            return model(x) if isinstance(model(x), torch.Tensor) else torch.randn(x.shape[0], 128, device=self.device)
+            output = model(x)
+            return output if isinstance(output, torch.Tensor) else torch.randn(x.shape[0], 128, device=self.device)
     
     def _local_train(self, client, gap_features, round_idx, client_idx):
         """
