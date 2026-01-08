@@ -173,8 +173,9 @@ def main(algorithm='fedavg', num_rounds=10, num_clients=5, seed=42):
         
         # Evaluate
         if isinstance(runner, FedEvoRunner):
-            # For FedEvo: evaluate candidate with highest usage (not candidate 0)
-            eval_model = runner.pop[runner.last_eval_candidate_idx]
+            # For FedEvo: evaluate runner.pop[0], which is the elite (highest-ranked by usage count)
+            # after _evolve() has sorted the population in run_round().
+            eval_model = runner.pop[0]
         else:
             eval_model = runner.model
         

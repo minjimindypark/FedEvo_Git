@@ -47,8 +47,11 @@ class FedImproRunner(BaseRunner):
         """
         client.model.eval()
         
-        # Initialize storage for per-class features
-        class_features = {c: [] for c in range(self.num_classes)}
+        # Initialize accumulators for per-class statistics
+        sums = {}
+        sums2 = {}
+        counts = {}
+        D = None
         
         with torch.no_grad():
             for x, y in client.dataloader:
@@ -58,23 +61,40 @@ class FedImproRunner(BaseRunner):
                 h = self._extract_features(client.model, x)
                 
                 # D is dynamic from h.shape[1] (note: split implies D=128)
-                D = h.shape[1]
+                if D is None:
+                    D = h.shape[1]
                 
                 # Iterate only over unique labels in this batch (optimization)
-                for c in y.unique().tolist():
+                unique_labels = torch.unique(y)
+                for c_tensor in unique_labels:
+                    c = int(c_tensor.item())
                     mask = (y == c)
-                    if mask.any():
-                        class_features[c].append(h[mask])
+                    hc = h[mask]
+                    
+                    if c not in sums:
+                        sums[c] = torch.zeros(D, device=self.device)
+                        sums2[c] = torch.zeros(D, device=self.device)
+                        counts[c] = 0
+                    
+                    sums[c] += hc.sum(dim=0)
+                    sums2[c] += (hc ** 2).sum(dim=0)
+                    counts[c] += hc.shape[0]
         
         # Compute statistics per class
         gap_stats = {}
         for c in range(self.num_classes):
-            if len(class_features[c]) > 0:
-                feats = torch.cat(class_features[c], dim=0)
+            if c in counts and counts[c] > 0:
+                mean = sums[c] / counts[c]
+                # Compute std: sqrt(E[X^2] - (E[X])^2)
+                mean_sq = sums2[c] / counts[c]
+                variance = mean_sq - mean ** 2
+                # Clamp to avoid numerical issues
+                variance = torch.clamp(variance, min=0.0)
+                std = torch.sqrt(variance)
                 gap_stats[c] = {
-                    'mean': feats.mean(dim=0),
-                    'std': feats.std(dim=0),
-                    'count': feats.shape[0]
+                    'mean': mean,
+                    'std': std,
+                    'count': counts[c]
                 }
             else:
                 gap_stats[c] = {

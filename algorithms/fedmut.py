@@ -36,29 +36,20 @@ class FedMutRunner(BaseRunner):
         w_curr = self.fedavg_aggregate(client_weights, client_sizes)
         self.load_param_state_dict(self.model, w_curr)
         
-        # Skip mutation at round 0
-        if self.round_idx == 0:
-            self.w_prev = {k: v.clone() for k, v in w_curr.items()}
-            self.round_idx += 1
-            return {}
+        # We explicitly skip mutation at round 0 to ensure all clients start from the clean initial global model.
+        if self.round_idx > 0 and self.w_prev is not None:
+            self._mutate_in_place(w_curr, self.w_prev)
         
-        # Apply mutation for rounds > 0
-        if self.w_prev is not None:
-            w_mutated = self._apply_mutation(w_curr, self.w_prev)
-            self.load_param_state_dict(self.model, w_mutated)
-            self.w_prev = {k: v.clone() for k, v in w_mutated.items()}
-        
+        self.w_prev = {k: v.clone() for k, v in w_curr.items()}
         self.round_idx += 1
         return {}
     
-    def _apply_mutation(self, w_curr, w_prev):
+    def _mutate_in_place(self, w_curr, w_prev):
         """
-        Apply gradient-based mutation.
+        Apply gradient-based mutation in-place.
         
         Mask granularity: one scalar sign per parameter tensor key from model.named_parameters().
         """
-        w_mutated = {}
-        
         for k in w_curr.keys():
             # Compute gradient estimate: g_r = w_curr - w_prev
             g_r = w_curr[k] - w_prev[k]
@@ -67,8 +58,6 @@ class FedMutRunner(BaseRunner):
             if torch.rand(1).item() < self.mutation_prob:
                 # Flip the sign of the entire tensor
                 sign = torch.sign(torch.randn(1)).item()
-                w_mutated[k] = w_curr[k] + sign * g_r.abs()
-            else:
-                w_mutated[k] = w_curr[k]
+                w_curr[k] = w_curr[k] + sign * g_r.abs()
         
-        return w_mutated
+        self.load_param_state_dict(self.model, w_curr)

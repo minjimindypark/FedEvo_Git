@@ -24,7 +24,7 @@ class FedEvoRunner(BaseRunner):
         """
         Run one round of FedEvo.
         
-        Before evolve/reset, store last_eval_candidate_idx as argmax of usage_round.
+        Calls _evolve() which sorts elites by usage count first.
         """
         client_weights = []
         client_sizes = []
@@ -49,9 +49,6 @@ class FedEvoRunner(BaseRunner):
             client_weights.append(self.param_state_dict(client.model))
             client_sizes.append(len(client.dataset))
         
-        # Store the candidate with highest usage in this round (for evaluation)
-        self.last_eval_candidate_idx = np.argmax(self.usage_round)
-        
         # Update population with aggregated weights
         w_new = self.fedavg_aggregate(client_weights, client_sizes)
         
@@ -59,13 +56,21 @@ class FedEvoRunner(BaseRunner):
         update_idx = np.random.randint(0, self.pop_size)
         self.load_param_state_dict(self.pop[update_idx], w_new)
         
-        # Update main model with best candidate
-        self.load_param_state_dict(self.model, self.param_state_dict(self.pop[self.last_eval_candidate_idx]))
+        # Evolve population: sort by usage count (elites first)
+        self._evolve()
+        
+        # Update main model with elite (pop[0] after evolution)
+        self.load_param_state_dict(self.model, self.param_state_dict(self.pop[0]))
         
         return {}
     
-    def evolve(self):
-        """Evolve population (simplified evolutionary operators)."""
-        # Placeholder for evolutionary operations
-        # Could include mutation, crossover, selection, etc.
-        pass
+    def _evolve(self):
+        """
+        Evolve population by sorting candidates by usage count (elites first).
+        
+        After this call, pop[0] contains the candidate with the highest usage count.
+        """
+        # Sort population by usage count (descending order)
+        sorted_indices = sorted(range(self.pop_size), key=lambda i: self.usage[i], reverse=True)
+        self.pop = [self.pop[i] for i in sorted_indices]
+        self.usage = [self.usage[i] for i in sorted_indices]
