@@ -4,7 +4,7 @@ import copy
 import math
 import os
 import random
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -176,3 +176,78 @@ def local_train_sgd(
             total += int(y.numel())
 
     return total_loss / max(1, total)
+
+# ============================================================
+# Runner base classes (public API for algorithms package)
+# ============================================================
+
+class BaseRunner:
+    """
+    Public base runner interface exported by algorithms package.
+    All algorithm runners should implement:
+      run_round(...) -> (train_loss: float, uplink_bytes: int)
+    """
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+
+    def run_round(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class FedAvgRunner(BaseRunner):
+    """
+    Simple FedAvg baseline runner.
+    Uses:
+      - param_state_dict / load_param_state_dict_
+      - local_train_sgd (defined in this file)
+      - uplink_bytes_for_delta
+      - fedavg_aggregate
+    """
+
+    def __init__(self, model: nn.Module, device: torch.device) -> None:
+        super().__init__(device=device)
+        self.model = model.to(device)
+
+    def run_round(
+        self,
+        client_ids: Sequence[int],
+        client_train_loaders: Dict[int, DataLoader],
+        epochs: int,
+        sgd_cfg: Tuple[float, float, float],
+        seed_train: int,
+    ) -> Tuple[float, int]:
+        lr, momentum, weight_decay = sgd_cfg
+
+        server_params = param_state_dict(self.model)
+        deltas: List[Dict[str, torch.Tensor]] = []
+        uplink = 0
+        losses: List[float] = []
+
+        for cid in client_ids:
+            cid_int = int(cid)
+
+            local = copy.deepcopy(self.model)
+            load_param_state_dict_(local, server_params)
+
+            loss = local_train_sgd(
+                model=local,
+                loader=client_train_loaders[cid_int],
+                device=self.device,
+                epochs=int(epochs),
+                lr=float(lr),
+                momentum=float(momentum),
+                weight_decay=float(weight_decay),
+                seed_train=int(seed_train) + cid_int,
+            )
+            losses.append(loss)
+
+            client_params = param_state_dict(local)
+            delta = {k: (client_params[k] - server_params[k]) for k in server_params.keys()}
+            deltas.append(delta)
+            uplink += uplink_bytes_for_delta(delta)
+
+        if deltas:
+            new_params = fedavg_aggregate(server_params, deltas)
+            load_param_state_dict_(self.model, new_params)
+
+        return float(np.mean(losses)) if losses else 0.0, int(uplink)

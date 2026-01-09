@@ -81,9 +81,20 @@ def main() -> None:
         runner = FedImproRunner(split_model=split, num_classes=bundle.num_classes, device=device)
         server_model_for_eval = runner.model  # wrapper has forward
     else:
-        runner = FedEvoRunner(model_ctor=ResNet18_CIFAR, num_classes=bundle.num_classes, device=device, m=5, seed_evo=2025)
-        # Evaluate on "best" candidate each round? We'll evaluate the most-used candidate in current population.
+        runner = FedEvoRunner(
+            model_ctor=ResNet18_CIFAR,
+            num_classes=bundle.num_classes,
+            device=device,
+            d=512,
+            m=5,
+            seed_evo=2025,
+            nu_scale=0.02,     # ← 추가/수정
+            nu_min=1e-6,       # ← 추가
+            nu_max=5e-3,       # ← 추가
+            feedback_log_path="logs/implicit_feedback.csv",
+        )
         server_model_for_eval = runner.model
+
 
     # Server-side LR scheduler stepped per round.
     # For FedMut/FedImpro we can attach scheduler to a dummy optimizer on server model params.
@@ -127,12 +138,11 @@ def main() -> None:
 
             # Evaluate global model
             if args.algo == "fedevo":
-                # pick candidate with highest usage in this round? runner resets usage after evolve.
-                # minimal: evaluate candidate 0.
-                runner._load_candidate_into_model(runner.model, runner.pop[0])
-                _, acc = evaluate(runner.model, test_loader, device=device)
+                model_for_eval = runner.get_best_model()  # loads runner.theta_base into runner.model
+                _, acc = evaluate(model_for_eval, test_loader, device=device)
             else:
                 _, acc = evaluate(server_model_for_eval, test_loader, device=device)
+
 
             writer.writerow(
                 {
