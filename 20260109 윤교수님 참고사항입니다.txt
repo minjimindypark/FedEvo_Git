@@ -184,16 +184,22 @@ fc.weight가 너무 noisy하다는 걸 확인.
 
 
 이번에는 FC.WEIGHT-ONLY TEST MODE 없애고 d=512, nu_scale=0.01로 실험 다시 돌림
-[FedEvo R1] H=0.898 τ=1.288 |S_j|=[3, 6, 0, 0, 1] mut=Y attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0002/0.0002/0.0004
-[FedEvo R2] H=0.943 τ=1.288 |S_j|=[1, 0, 0, 4, 5] mut=Y attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0002/0.0001/0.0005
-
-이에 대한 이유로는
-(가장 유력) seed가 고정되지 않아서 클라이언트 샘플링/데이터 split/센티넬 좌표 선택/학습 순서가 매번 달라졌고, 그 결과 |S_j|가 달라져서 attr_r도 같이 흔들린 것.
-(다음 유력) pop_raw 초기 상태가 동일하지 않거나, 이전 실행 상태/캐시를 이어받아 시작했을 가능성.
-(보조 원인) fc.weight-only test를 켰다 끄는 과정에서 RNG 소비 패턴이 바뀌어 같은 seed라도 실행 궤적이 달라졌을 가능성.
+[FedEvo R1] H=1.194 τ=1.288 |S_j|=[4, 1, 4, 0, 1] mut=Y attr_r=0.000 attr_c=0.000 margin(mean/p50/p90)=0.0001/0.0001/0.0002
+[FedEvo R2] H=1.194 τ=1.288 |S_j|=[1, 4, 0, 1, 4] mut=Y attr_r=0.200 attr_c=0.100 margin(mean/p50/p90)=0.0002/0.0001/0.0004
 
 결론: 아직 attr_r=값을 높이는 방안을 찾지 못함.
 
 
 *파워쉘에 다음의 요청을 통해 실험을 돌림
+
+cd "C:\Users\박민지\OneDrive - 한국에너지공과대학교\바탕 화면\FedEvo\FedEvo_Git"
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+
 python main.py --algo fedevo --dataset cifar10 --rounds 2 --out_csv results_fedmut_v2.csv --data_dir ./data
+
+* 다른 논문들의 깃허브는 다음과 같음
+
+https://github.com/wizard1203/FedImpro
+https://github.com/HMHelloWorld/FedMut
