@@ -130,21 +130,70 @@ d=512, nu_scale=0.01
 d=512, nu_scale=0.02
 [FedEvo R1] H=1.280 τ=1.288 |S_j|=[2, 0, 3, 4, 1] mut=Y attr_r=0.300 attr_c=0.300 margin(mean/p50/p90)=0.0002/0.0001/0.0003
 
-위의 결과값이 나왔음.
 
-추후 할 일:
+d=1024, nu_scale=0.01
+[FedEvo R1] H=1.055 τ=1.288 |S_j|=[4, 0, 0, 4, 2] mut=Y attr_r=0.000 attr_c=0.000 margin(mean/p50/p90)=0.0003/0.0002/0.0007
+[FedEvo R2] H=1.471 τ=1.288 |S_j|=[2, 1, 2, 1, 4] mut=N attr_r=0.200 attr_c=0.100 margin(mean/p50/p90)=0.0002/0.0002/0.0004
 
-(1) d=1024, nu_scale=0.01
+d=2048, nu_scale=0.01
+C:\Users\박민지\OneDrive - 한국에너지공과대학교\바탕 화면\FedEvo\FedEvo_Git\algorithms\fedevo.py:292: UserWarning: Low-sens pool insufficient; using ALL params.
+  warnings.warn("Low-sens pool insufficient; using ALL params.")
+[FedEvo R1] H=1.055 τ=1.288 |S_j|=[0, 2, 4, 0, 4] mut=Y attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0001/0.0001/0.0001
+[FedEvo R2] H=1.168 τ=1.288 |S_j|=[1, 3, 1, 5, 0] mut=Y attr_r=0.000 attr_c=0.050 margin(mean/p50/p90)=0.0002/0.0001/0.0004
 
-(2) d=2048, nu_scale=0.01
-
-(3) d=1024, nu_scale=0.02
-
-으로 다시 실험 돌려보고,
-
-이후 pool을 fc.weight-only로 1번 테스트
-→ 여기서 점프하면 (A)가 원인 확정
-
-마지막으로 단위 테스트로 (B) 완전 제거
+d=1024, nu_scale=0.02
+[FedEvo R1] H=0.943 τ=1.288 |S_j|=[5, 0, 0, 4, 1] mut=Y attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0004/0.0002/0.0008
+[FedEvo R2] H=1.221 τ=1.288 |S_j|=[1, 2, 0, 2, 5] mut=Y attr_r=0.200 attr_c=0.150 margin(mean/p50/p90)=0.0004/0.0003/0.0008
 
 
+->d(센티넬 좌표 개수)와 ν(센티넬 크기)만으로는 attr_r을 0.8 이상까지 올리기엔 구조적 한계가 있음.
+d=512, nu_scale=0.01 일때 가장 안정적으로 보임
+
+
+
+다시 (A)로 돌아가서
+
+FedEvo.py에: pool을 fc.weight-only로 1번 테스트.
+d=512, nu_scale=0.01
+
+
+        # ===== FC.WEIGHT-ONLY TEST MODE =====
+        # 센티넬을 무조건 fc.weight에만 심어서
+        # "low_sens_pool 선택 문제인지"를 빠르게 진단한다.
+        fc_key = None
+        for key in self.param_keys:
+            kl = key.lower()
+            if "fc" in kl and "weight" in kl:
+                fc_key = key
+                break
+
+        if fc_key is None:
+            raise RuntimeError("FC.WEIGHT-ONLY TEST: could not find fc.weight key in param_keys")
+
+        self.low_sens_pool = [(fc_key, i) for i in range(self.base_params[fc_key].numel())]
+        return
+        # ===== END TEST MODE =====
+
+
+[FedEvo R1] H=1.609 τ=1.288 |S_j|=[2, 2, 2, 2, 2] mut=N attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0079/0.0053/0.0165
+[FedEvo R2] H=0.802 τ=1.288 |S_j|=[0, 7, 0, 2, 1] mut=Y attr_r=0.000 attr_c=0.050 margin(mean/p50/p90)=0.0258/0.0151/0.0681
+
+
+결과가 나옴.
+fc.weight가 너무 noisy하다는 걸 확인.
+
+
+이번에는 FC.WEIGHT-ONLY TEST MODE 없애고 d=512, nu_scale=0.01로 실험 다시 돌림
+[FedEvo R1] H=0.898 τ=1.288 |S_j|=[3, 6, 0, 0, 1] mut=Y attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0002/0.0002/0.0004
+[FedEvo R2] H=0.943 τ=1.288 |S_j|=[1, 0, 0, 4, 5] mut=Y attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0002/0.0001/0.0005
+
+이에 대한 이유로는
+(가장 유력) seed가 고정되지 않아서 클라이언트 샘플링/데이터 split/센티넬 좌표 선택/학습 순서가 매번 달라졌고, 그 결과 |S_j|가 달라져서 attr_r도 같이 흔들린 것.
+(다음 유력) pop_raw 초기 상태가 동일하지 않거나, 이전 실행 상태/캐시를 이어받아 시작했을 가능성.
+(보조 원인) fc.weight-only test를 켰다 끄는 과정에서 RNG 소비 패턴이 바뀌어 같은 seed라도 실행 궤적이 달라졌을 가능성.
+
+결론: 아직 attr_r=값을 높이는 방안을 찾지 못함.
+
+
+*파워쉘에 다음의 요청을 통해 실험을 돌림
+python main.py --algo fedevo --dataset cifar10 --rounds 2 --out_csv results_fedmut_v2.csv --data_dir ./data
