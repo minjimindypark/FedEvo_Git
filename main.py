@@ -88,7 +88,7 @@ def main() -> None:
             d=512,
             m=5,
             seed_evo=2025,
-            nu_scale=0.02,     # ← 추가/수정
+            nu_scale=0.01,     # ← 추가/수정
             nu_min=1e-6,       # ← 추가
             nu_max=5e-3,       # ← 추가
             feedback_log_path="logs/implicit_feedback.csv",
