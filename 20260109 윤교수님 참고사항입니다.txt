@@ -1,0 +1,150 @@
+센티넬, GA추가하여 업데이트한 FedEvo 알고리즘 파일 (Fedevo.py) 을 토대로 실험을 돌려보니 attr_r=0.1이었기에 다음을 확인함
+
+(A). sentinel이 들어간 좌표가 “학습에 안 쓰이는 곳” low-sensitivity pool이 너무 “조용한 파라미터”일 수 있음 예: bias / running stat 위주면 delta가 거의 0 ->이 경우일 경우를 확인하기 위해
+
+# --- DEBUG: sentinel slice movement & sign check (C/D diagnosis) ---
+delta_slice = self._extract_delta_slice(delta, j_star)   # 이 클라가 실제로 선택한 후보의 sentinel 좌표 변화
+w = self.sentinel_values[j_star]                         # 그 후보의 sentinel 값(±nu)
+
+min_len = min(delta_slice.numel(), w.numel())
+if min_len > 0:
+    ds = delta_slice[:min_len].detach()
+    ww = w[:min_len].detach()
+
+    ds_norm = float(ds.norm().item())
+    w_norm  = float(ww.norm().item())
+
+    # 방향성 체크: delta_slice가 +w 쪽인지 -w 쪽인지
+    cos_plus  = float(F.cosine_similarity(ds.unsqueeze(0), ww.unsqueeze(0), dim=1).item())
+    cos_minus = float(F.cosine_similarity(ds.unsqueeze(0), (-ww).unsqueeze(0), dim=1).item())
+
+    # 너무 많이 찍히면 1~2명만 보자
+    if cid_int == int(St[0]):  # 라운드 첫 클라이언트만 출력
+        print(f"[DEBUG] cid={cid_int} j*={j_star} ||ds||={ds_norm:.3e} ||w||={w_norm:.3e} cos(ds,+w)={cos_plus:.3f} cos(ds,-w)={cos_minus:.3f}")
+else:
+    if cid_int == int(St[0]):
+        print(f"[DEBUG] cid={cid_int} j*={j_star} empty_slice(min_len=0)")
+# --- END DEBUG ---
+
+
+이 로그를 추가해서 확인해봄
+
+[DEBUG] cid=20 j*=4 ||ds||=2.604e-03 ||w||=8.000e-03 cos(ds,+w)=-0.084 cos(ds,-w)=0.084
+[FedEvo R1] H=1.359 τ=1.288 |S_j|=[1, 2, 5, 1, 1] mut=N attr_r=0.100 attr_c=0.100 margin(mean/p50/p90)=0.0000/0.0000/0.0001
+
+라는 결과가 나옴.
+
+그래서 아래의 질문을 확인해봄.
+
+(B). attribution 스코어가 맞지 않음 L2 vs cosine 부호(+/-) 해석 문제 delta + w vs delta − w 혼동 ->문제인지 확인하기 위해
+
+
+            # --- DEBUG 2: full ranking check (which scoring matches j*?) ---
+            if cid_int == int(St[0]):  # 라운드 첫 클라이언트만 출력
+                scores_l2_minus = []
+                scores_l2_plus = []
+                scores_cos_minus = []
+                scores_cos_plus = []
+
+                for j in range(self.m):
+                    dsj = self._extract_delta_slice(delta, j).float()
+                    wj = self.sentinel_values[j].float()
+                    min_len2 = min(dsj.numel(), wj.numel())
+                    if min_len2 == 0:
+                        scores_l2_minus.append(float("inf"))
+                        scores_l2_plus.append(float("inf"))
+                        scores_cos_minus.append(-1e30)
+                        scores_cos_plus.append(-1e30)
+                        continue
+
+                    ds2 = dsj[:min_len2]
+                    w2 = wj[:min_len2]
+
+                    # L2 distance (작을수록 좋음)
+                    scores_l2_minus.append(float((ds2 + w2).norm().item()))  # ds ~ -w 가정
+                    scores_l2_plus.append(float((ds2 - w2).norm().item()))   # ds ~ +w 가정
+
+                    # Cosine (클수록 좋음)
+                    scores_cos_minus.append(float(F.cosine_similarity(ds2.unsqueeze(0), (-w2).unsqueeze(0), dim=1).item()))
+                    scores_cos_plus.append(float(F.cosine_similarity(ds2.unsqueeze(0), (w2).unsqueeze(0), dim=1).item()))
+
+                best_l2_minus = int(np.argmin(scores_l2_minus))
+                best_l2_plus  = int(np.argmin(scores_l2_plus))
+                best_cos_minus = int(np.argmax(scores_cos_minus))
+                best_cos_plus  = int(np.argmax(scores_cos_plus))
+
+                print(
+                    f"[DEBUG2] cid={cid_int} j*={j_star} "
+                    f"best_l2(-w)={best_l2_minus} best_l2(+w)={best_l2_plus} "
+                    f"best_cos(-w)={best_cos_minus} best_cos(+w)={best_cos_plus}"
+                )
+            # --- END DEBUG 2 ---
+
+
+이 코드로 확인함
+
+[DBG-sign] cid=20 j*=4 cos(ds,+w)=-0.084 cos(ds,-w)=+0.084 l2(ds,+w)=8.619e-03 l2(ds,-w)=8.202e-03
+-> D에 해당하는 문제는 아니라는 뜻
+
+[DEBUG] cid=20 j*=4 ||ds||=2.604e-03 ||w||=8.000e-03 cos(ds,+w)=-0.084 cos(ds,-w)=0.084
+-> ds는 w보다 약 3배 작음. 센티넬이 남아있긴 하지만 신호가 아주 약하다는 말. 위의 C문제는 아닌듯 보임
+
+[DEBUG2] cid=20 j*=4 best_l2(-w)=0 best_l2(+w)=3 best_cos(-w)=0 best_cos(+w)=3
+
+->attribution이 잘 안되고 있음
+
+
+
+(C). d가 작다 좌표 수가 적어서 gradient noise에 묻힘
+->을 확인하기 위해서 d=64에서 d=256으로 바꿔봄
+attr_r=0.300으로, 0.1에서 0.3으로 개선됨!!
+
+(D). ν가 작다 각 좌표 변화량이 너무 미세 delta에 거의 안 남음
+main.py 파일에서 
+
+
+            nu_scale=0.02,     # ← 추가/수정
+            nu_min=1e-6,       # ← 추가
+            nu_max=5e-3,       # ← 추가
+
+
+하였더니 
+
+[FedEvo R1] H=0.950 τ=1.288 |S_j|=[6, 0, 2, 0, 2] mut=Y attr_r=0.200 attr_c=0.200 margin(mean/p50/p90)=0.0000/0.0000/0.0001
+
+값이 나왔다. 0.1에서 0.2로 나아지기는 함!
+하지만 숫자를 보면 랜덤수준이긴함
+
+그래서
+
+d=512로 올리고 nu_scale은 일단 기본(0.005)
+→ attr_r이 0.3→0.4~0.6으로 오르는지 확인
+
+Main.py 파일에서
+d=512, nu_scale=0.005
+[FedEvo R1] H=1.030 τ=1.288 |S_j|=[0, 0, 2, 3, 5] mut=Y attr_r=0.200 attr_c=0.200 margin(mean/p50/p90)=0.0001/0.0001/0.0004
+
+d=512, nu_scale=0.01
+[FedEvo R1] H=1.505 τ=1.288 |S_j|=[3, 1, 1, 3, 2] mut=N attr_r=0.300 attr_c=0.300 margin(mean/p50/p90)=0.0001/0.0000/0.0002
+
+d=512, nu_scale=0.02
+[FedEvo R1] H=1.280 τ=1.288 |S_j|=[2, 0, 3, 4, 1] mut=Y attr_r=0.300 attr_c=0.300 margin(mean/p50/p90)=0.0002/0.0001/0.0003
+
+위의 결과값이 나왔음.
+
+추후 할 일:
+
+(1) d=1024, nu_scale=0.01
+
+(2) d=2048, nu_scale=0.01
+
+(3) d=1024, nu_scale=0.02
+
+으로 다시 실험 돌려보고,
+
+이후 pool을 fc.weight-only로 1번 테스트
+→ 여기서 점프하면 (A)가 원인 확정
+
+마지막으로 단위 테스트로 (B) 완전 제거
+
+
