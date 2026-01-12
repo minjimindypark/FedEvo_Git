@@ -151,40 +151,58 @@ d=1024, nu_scale=0.02
 d=512, nu_scale=0.01 일때 가장 안정적으로 보임
 
 
+20260112
 
-다시 (A)로 돌아가서
+기존 델타 계산 법:
+# Delta w.r.t. SENTINEL-EMBEDDED candidate
+delta = {
+    k: (local_params[k].float() - self.pop_sent[j_star][k].float()).to(local_params[k].dtype)
+    for k in self.param_keys
+}
 
-FedEvo.py에: pool을 fc.weight-only로 1번 테스트.
-d=512, nu_scale=0.01
+w_j랑 얼마나 비슷한지 후보 고르는 방법
+score = _l2_score(delta_slice[:min_len], w_j[:min_len])
+best_j = argmin(score)
 
-269줄 (def _build_low_sens_index_pool(self) -> None:) 바로 아래쪽에    
-        # ===== FC.WEIGHT-ONLY TEST MODE =====
-        # 센티넬을 무조건 fc.weight에만 심어서
-        # "low_sens_pool 선택 문제인지"를 빠르게 진단한다.
-        fc_key = None
-        for key in self.param_keys:
-            kl = key.lower()
-            if "fc" in kl and "weight" in kl:
-                fc_key = key
-                break
+-> 이걸 수정함.
+delta는 pop_raw 기준으로 계산
 
-        if fc_key is None:
-            raise RuntimeError("FC.WEIGHT-ONLY TEST: could not find fc.weight key in param_keys")
-
-        self.low_sens_pool = [(fc_key, i) for i in range(self.base_params[fc_key].numel())]
-        return
-        # ===== END TEST MODE =====
-
-테스트 하면 된다고 하는데 따로 설정을 해줘야하는게 있을 것 같아서 아직 테스트를 못하고있어요!
+# Delta w.r.t. SENTINEL-FREE base (client trained on pop_sent[j_star])
+delta = {
+    k: (local_params[k].float() - self.pop_raw[j_star][k].float()).to(local_params[k].dtype)
+    for k in self.param_keys
+}
 
 
-결론: 아직 attr_r=값을 높이는 방안을 찾지 못함.
+즉, - delta = local - pop_sent[j_star] (delta = (학습 후 모델) - (열쇠가 박힌 모델))
++ delta = local - pop_raw[j_star] (delta = (학습 후 모델) - (열쇠가 없는 기본 모델))
+로 바꿈.
+
+또, def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
+    # Paper-style attribution scoring (example: ||delta + w||^2)
+    return float((delta_slice + w_j).norm().pow(2).item())
+부분은
+
+def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
+    # If sentinel is embedded as +w in params, delta_slice should match +w.
+    # So attribution should minimize ||delta - w||^2.
+    diff = delta_slice - w_j
+    return float(diff.norm().pow(2).item())
+로 바꿈
+
+epochs=0 으로 세팅하여 실험함
+[FedEvo R1] H=1.557 τ=1.288 |S_j|=[1, 2, 3, 2, 2] mut=N attr_r=1.000 attr_c=1.000 margin(mean/p50/p90)=0.0127/0.0127/0.0127
+[FedEvo R2] H=1.366 τ=1.288 |S_j|=[2, 2, 3, 3, 0] mut=N attr_r=1.000 attr_c=1.000 margin(mean/p50/p90)=0.0127/0.0127/0.0127
+
+epochs=1로 세팅하여 실험함
+[FedEvo R1] H=1.366 τ=1.288 |S_j|=[0, 2, 3, 2, 3] mut=N attr_r=1.000 attr_c=1.000 margin(mean/p50/p90)=0.0126/0.0126/0.0127
+[FedEvo R2] H=1.471 τ=1.288 |S_j|=[4, 1, 2, 1, 2] mut=N attr_r=1.000 attr_c=1.000 margin(mean/p50/p90)=0.0125/0.0126/0.0127
+
+epochs=5로세팅하여 실험함
+
 
 질문: nu_scale을 0.1, 0.2, 0.05로 바꿔가며 실험을 했는데,
 nu_max=5e-3, nu_min=1e-6으로 잡는 것이 맞는지? (챗GPT는 이렇게 해야 안전하다고 해서요..)
-
-FC.WEIGHT-ONLY TEST를 하기 위해서 설정을 어떻게 해줘야하는지?
-
 
 *파워쉘에 다음의 요청을 통해 실험을 돌림
 
@@ -193,7 +211,8 @@ cd "C:\Users\박민지\OneDrive - 한국에너지공과대학교\바탕 화면\F
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 
-python main.py --algo fedevo --dataset cifar10 --rounds 2 --out_csv results_fedmut_v2.csv --data_dir ./data
+python main.py --algo fedevo --dataset cifar10 --rounds 2 --out_dir "C:\Users\박민지\OneDrive - 한국에너지공과대학교\바탕 화면\FedEvo\FedEvo_Git\results" --data_dir ./data
+
 
 * 다른 논문들의 깃허브는 다음과 같음
 

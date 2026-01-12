@@ -54,8 +54,11 @@ class CandidateSlot:
 
 
 def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
-    # Paper-style attribution scoring (example: ||delta + w||^2)
-    return float((delta_slice + w_j).norm().pow(2).item())
+    # If sentinel is embedded as +w in params, delta_slice should match +w.
+    # So attribution should minimize ||delta - w||^2.
+    diff = delta_slice - w_j
+    return float(diff.norm().pow(2).item())
+
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -452,11 +455,14 @@ class FedEvoRunner:
             local_params = param_state_dict(local_model)
             all_local_params.append(local_params)
 
-            # Delta w.r.t. SENTINEL-EMBEDDED candidate (client trained on pop_sent[j_star])
+            # Delta w.r.t. SENTINEL-FREE base (client trained on pop_sent[j_star])
+            # local ≈ pop_raw + sentinel + training_update
+            # so (local - pop_raw) exposes sentinel
             delta = {
-                k: (local_params[k].float() - self.pop_sent[j_star][k].float()).to(local_params[k].dtype)
+                k: (local_params[k].float() - self.pop_raw[j_star][k].float()).to(local_params[k].dtype)
                 for k in self.param_keys
             }
+
             uplink_bytes += uplink_bytes_for_delta(delta)
 
             all_deltas.append(delta)
@@ -748,8 +754,15 @@ class FedEvoRunner:
                 bs = int(y.numel())
                 total_loss += float(loss.item()) * bs
                 total_samples += bs
+        if total_samples == 0:
+            # epochs=0 스모크 테스트 등에서 가중치가 0이 되어 평균이 터지는 걸 방지
+            try:
+                total_samples = int(len(loader.dataset))
+            except Exception:
+                total_samples = 1  # 최후의 안전장치
 
         return total_loss / max(1, total_samples), total_samples
+    
 
     def get_best_model(self) -> nn.Module:
         load_param_state_dict_(self.model, self.theta_base)
