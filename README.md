@@ -1,13 +1,14 @@
-# FedEvo: Federated Learning Algorithms
+# FedEvo: Federated Learning Algorithms (FedMut / FedImpro / FedEvo)
 
-This repository implements several federated learning algorithms according to the IJCNN implementation contract.
+This repository provides a small, reproducible **CIFAR-10/100** federated-learning runner with three algorithms:
 
-## Algorithms
+- **FedMut**: FedAvg-style aggregation with mutation after round 0
+- **FedImpro**: FedAvg-style aggregation with class-wise feature gap statistics
+- **FedEvo**: Evolutionary FL with a *population* of candidates and implicit client feedback (sentinel-based attribution)
 
-- **FedAvg**: Standard Federated Averaging
-- **FedMut**: FedAvg with gradient-based mutation
-- **FedImpro**: FedAvg with class-wise feature gap analysis
-- **FedEvo**: Evolutionary federated learning with population of models
+> Note: The current `main.py` CLI exposes **fedmut / fedimpro / fedevo** (not FedAvg as a standalone option).
+
+---
 
 ## Installation
 
@@ -15,66 +16,80 @@ This repository implements several federated learning algorithms according to th
 pip install -r requirements.txt
 ```
 
-## Usage
+---
 
-Run any algorithm with the main script:
+## Quick Start (your default run)
 
-```bash
-python main.py --algorithm fedavg --num_rounds 10 --num_clients 5
-python main.py --algorithm fedmut --num_rounds 10 --num_clients 5
-python main.py --algorithm fedimpro --num_rounds 10 --num_clients 5
-python main.py --algorithm fedevo --num_rounds 10 --num_clients 5
+You said you'll run experiments like this each time:
+
+```powershell
+python main.py --algo fedevo --dataset cifar10 --rounds 2 --out_dir "C:\Users\박민지\OneDrive - 한국에너지공과대학교\바탕 화면\FedEvo\FedEvo_Git\results" --data_dir ./data
 ```
 
-### Arguments
+### What happens
+- Results are saved as **CSV** inside `--out_dir`.
+- The filename is auto-generated:
 
-- `--algorithm`: Algorithm to use (fedavg, fedmut, fedimpro, fedevo)
-- `--num_rounds`: Number of federated learning rounds
-- `--num_clients`: Number of clients
-- `--seed`: Random seed for reproducibility
+`{algo}_{dataset}_{YYYYMMDD-HHMMSS}.csv`
 
-## Output
+Example:
+`fedevo_cifar10_20260112-104233.csv`
 
-The script outputs CSV format with columns:
-- `round`: Round index
-- `test_accuracy`: Test accuracy percentage
-- `train_loss`: Training loss
-- `uplink_bytes`: Total uplink bytes from all clients
+If you want to override the full output path (including the filename), use:
 
-## Implementation Details
+```powershell
+python main.py --algo fedevo --dataset cifar10 --rounds 2 --out_csv "C:\path\to\my_custom_name.csv" --data_dir ./data
+```
 
-### FedMut (algorithms/fedmut.py)
-- Skips mutation at round 0 (only performs FedAvg)
-- For rounds > 0, applies gradient-based mutation: `g_r = w_curr - w_prev`
-- Mask granularity: one scalar sign per parameter tensor
+---
 
-### FedImpro (algorithms/fedimpro.py)
-- Optimized feature collection: iterates only over unique labels in each batch
-- Uses deterministic RNG for synthetic label sampling: `seed + 9999`
-- Dynamic feature dimension D from `h.shape[1]`
+## CLI Arguments
 
-### FedEvo (algorithms/fedevo.py)
-- Maintains population of candidate models
-- Evaluates candidate with highest usage in current round
-- Does not evaluate candidate 0
+- `--algo` : `fedmut | fedimpro | fedevo`
+- `--dataset` : `cifar10 | cifar100`
+- `--alpha` : Dirichlet partition parameter for label-skew (default `0.1`, options `0.1` or `0.5`)
+- `--rounds` : number of FL rounds (default `1000`)
+- `--out_dir` : directory for auto-named CSV output (default `./results`)
+- `--out_csv` : optional explicit CSV path (overrides `--out_dir`)
+- `--data_dir` : dataset directory (default `./data`)
 
-### BatchNorm Buffers Policy
-- Only learnable parameters are aggregated (via `named_parameters()`)
-- BN running stats (buffers) are NOT aggregated
-- BN buffers remain local to each client
-- See comments in `algorithms/base.py` and `main.py`
+---
 
-## File Structure
+## Output CSV Format
+
+`main.py` writes one row per round:
+
+- `round`
+- `test_accuracy`
+- `train_loss`
+- `uplink_bytes`
+
+---
+
+## Important Reproducibility Note (Determinism)
+
+`algorithms/base.py:set_global_seed()` enables **hard determinism** (cuDNN deterministic + `torch.use_deterministic_algorithms(True)`).
+This improves reproducibility, but some PyTorch ops can error if they don't have deterministic implementations.
+
+If you see errors like:
+`RuntimeError: deterministic algorithms are not available for this operation`
+
+the fix is to make determinism optional (e.g., `--deterministic 0/1`) and default it to OFF for beginners.
+
+---
+
+## Repository Structure
 
 ```
 .
 ├── algorithms/
-│   ├── __init__.py
-│   ├── base.py       # Base classes and FedAvg
-│   ├── fedmut.py     # FedMut implementation
-│   ├── fedimpro.py   # FedImpro implementation
-│   └── fedevo.py     # FedEvo implementation
-├── main.py           # Main training script
-├── requirements.txt  # Python dependencies
-└── README.md         # This file
+│   ├── base.py       # utilities + aggregation + evaluate + deterministic seeding
+│   ├── fedmut.py
+│   ├── fedimpro.py
+│   └── fedevo.py
+├── data_utils.py      # CIFAR loading + Dirichlet partition + per-client splits
+├── models.py          # ResNet18_CIFAR (+ split model builder for FedImpro)
+├── main.py            # end-to-end runner (CLI)
+├── requirements.txt
+└── README.md
 ```

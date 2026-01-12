@@ -1,3 +1,6 @@
+import os
+from datetime import datetime
+
 import argparse
 import csv
 import copy
@@ -12,6 +15,16 @@ from algorithms.fedmut import FedMutRunner
 from algorithms.fedevo import FedEvoRunner
 from data_utils import client_train_val_split, dirichlet_partition, load_cifar, make_subset
 from models import ResNet18_CIFAR, build_split_resnet18_cifar
+
+def build_out_csv_path(out_dir: str, algo: str, dataset: str) -> str:
+    """
+    결과 CSV 파일명을 자동 생성한다.
+    예: ./results/fedevo_cifar10_20260112-104233.csv
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"{algo}_{dataset}_{ts}.csv"
+    return os.path.join(out_dir, filename)
 
 
 def build_client_schedule(num_clients: int, clients_per_round: int, rounds: int, seed_sample: int) -> List[List[int]]:
@@ -29,9 +42,16 @@ def main() -> None:
     p.add_argument("--dataset", type=str, required=True, choices=["cifar10", "cifar100"])
     p.add_argument("--alpha", type=float, default=0.1, choices=[0.1, 0.5])
     p.add_argument("--rounds", type=int, default=1000)
-    p.add_argument("--out_csv", type=str, required=True)
+    p.add_argument("--out_dir", type=str, default="./results", help="Directory to save results CSV")
+    p.add_argument("--out_csv", type=str, default="", help="(Optional) Override output CSV path")
     p.add_argument("--data_dir", type=str, default="./data")
     args = p.parse_args()
+
+    if args.out_csv and args.out_csv.strip():
+        out_csv_path = args.out_csv
+    else:
+        out_csv_path = build_out_csv_path(args.out_dir, args.algo, args.dataset)
+
 
     # Locked setup
     N = 100
@@ -101,7 +121,7 @@ def main() -> None:
     # We'll implement: apply scheduler scale to client lr by updating lr each round.
     lr_current = lr
 
-    with open(args.out_csv, "w", newline="") as f:
+    with open(out_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["round", "test_accuracy", "train_loss", "uplink_bytes"])
         writer.writeheader()
 
