@@ -1,3 +1,14 @@
+"""
+data_utils.py
+
+Dataset loading and client partitioning utilities for federated learning experiments.
+Includes:
+- CIFAR-10/100 loading and normalization
+- Dirichlet-based Non-IID client partitioning
+- Per-client train/validation splits used for model selection in FedEvo
+"""
+
+
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 

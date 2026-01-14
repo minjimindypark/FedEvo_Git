@@ -1,3 +1,36 @@
+"""
+models.py
+
+Model definitions used in the FedEvo experiments.
+- ResNet18_CIFAR: ResNet-18 variant adapted for CIFAR-10/100
+- build_split_resnet18_cifar: helper to construct split models for FedImpro
+
+Design note:
+Models are intentionally kept minimal and deterministic-friendly
+to isolate the effect of the learning algorithm (FedEvo) rather than architecture choices.
+"""
+"""
+main.py
+
+Entry point for federated learning experiments, including FedMut, FedImpro, and FedEvo.
+
+This script reproduces all experimental results reported in the paper.
+
+CLI design:
+- --algo, --dataset: select algorithm and dataset
+- --alpha: Dirichlet concentration parameter controlling Non-IID severity
+- --rounds: number of federated communication rounds
+
+FedEvo-specific knobs (Section X in the paper):
+- --d: sentinel dimension per candidate (must satisfy low-sensitivity pool size)
+- --nu_scale: sentinel magnitude scaling, controlling attribution separability
+- --local_steps: number of local SGD steps; excessive values may weaken sentinel signals
+
+Recommended quick smoke test:
+python main.py --algo fedevo --dataset cifar10 --rounds 2 --d 512 --nu_scale 0.02 --local_steps 1
+"""
+
+
 import os
 from datetime import datetime
 
@@ -44,6 +77,15 @@ def main() -> None:
     p.add_argument("--rounds", type=int, default=1000)
     p.add_argument("--out_dir", type=str, default="./results", help="Directory to save results CSV")
     p.add_argument("--out_csv", type=str, default="", help="(Optional) Override output CSV path")
+
+    # ---- FedEvo auto-tune knobs (only used when --algo=fedevo) ----
+    p.add_argument("--d", type=int, default=1536, help="FedEvo sentinel dimension per candidate")
+    p.add_argument("--nu_scale", type=float, default=0.01, help="FedEvo nu scale")
+    p.add_argument("--local_steps", type=int, default=5, help="Local training steps/epochs (replaces E when fedEvo tuning)")
+    p.add_argument("--low_sens_mode", type=str, default="bias_norm", choices=["bias_only", "bias_norm"])
+    p.add_argument("--seed_train", type=int, default=44)
+    # --------------------------------------------------------------
+
     p.add_argument("--data_dir", type=str, default="./data")
     args = p.parse_args()
 
@@ -52,6 +94,7 @@ def main() -> None:
     else:
         out_csv_path = build_out_csv_path(args.out_dir, args.algo, args.dataset)
 
+    os.makedirs("logs", exist_ok=True)
 
     # Locked setup
     N = 100
@@ -65,7 +108,7 @@ def main() -> None:
 
     seed_data = 42
     seed_sample = 43
-    seed_train = 44
+    seed_train = args.seed_train
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_global_seed(seed_train)
@@ -102,17 +145,19 @@ def main() -> None:
         server_model_for_eval = runner.model  # wrapper has forward
     else:
         runner = FedEvoRunner(
-            model_ctor=ResNet18_CIFAR,
-            num_classes=bundle.num_classes,
-            device=device,
-            d=512,
-            m=5,
-            seed_evo=2025,
-            nu_scale=0.01,     # ← 추가/수정
-            nu_min=1e-6,       # ← 추가
-            nu_max=5e-3,       # ← 추가
-            feedback_log_path="logs/implicit_feedback.csv",
-        )
+        model_ctor=ResNet18_CIFAR,
+        num_classes=bundle.num_classes,
+        device=device,
+        d=args.d,
+        m=5,
+        seed_evo=2025,
+        nu_scale=args.nu_scale,
+        nu_min=1e-6,
+        nu_max=5e-2,
+        feedback_log_path="logs/implicit_feedback.csv",
+        low_sens_mode=args.low_sens_mode,   # ← (fedevo.py가 이 인자 받으면 사용)
+    )
+
         server_model_for_eval = runner.model
 
 
@@ -151,7 +196,7 @@ def main() -> None:
                     client_ids=client_ids,
                     client_train_loaders=client_train_loaders,
                     client_val_loaders=client_val_loaders,
-                    epochs=E,
+                    epochs=args.local_steps,
                     sgd_cfg=(lr_current, momentum, weight_decay),
                     seed_train=seed_train,
                 )

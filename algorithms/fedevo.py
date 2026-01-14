@@ -19,7 +19,7 @@ Implementation notes (paper-unspecified choices)
 - Interp parents: top-k by usage (design choice).
 - Soft elitism: bottom-ζ inserted first; only these are protected.
 - Mutation: targets slots whose source_id is in bottom 50% usage; synthetic excluded.
-- Sentinel: additive (θ[I_j] += w_j); ν clamped to [nu_min, nu_max].
+- Sentinel: overwrite (θ[I_j] ← w_j); ν clamped to [nu_min, nu_max].
 - Stabilizer: sample-weighted average of local final params (FedAvg style, default).
 - Attribution logging: round & cumulative accuracy + margin (mean, p50, p90).
 - Perf options: val_batches, recompute_nu_each_round, orth_subset_ratio, reuse_local_model.
@@ -54,11 +54,10 @@ class CandidateSlot:
 
 
 def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
-    # If sentinel is embedded as +w in params, delta_slice should match +w.
-    # So attribution should minimize ||delta - w||^2.
-    diff = delta_slice - w_j
+    # Overwrite(PDF) mode: with overwrite embedding, the paper's attribution
+    # is based on minimizing ||Δθ[I_j] + w_j||_2^2 (Eq.5).
+    diff = delta_slice + w_j
     return float(diff.norm().pow(2).item())
-
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -122,13 +121,26 @@ def _clone_params(params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v.clone() for k, v in params.items()}
 
 
-def _get_low_sensitivity_keys(params: Dict[str, torch.Tensor]) -> List[str]:
-    low_sens_keys: List[str] = []
+def _get_low_sensitivity_keys(params: Dict[str, torch.Tensor], mode: str) -> List[str]:
+    low: List[str] = []
     for key in params.keys():
         kl = key.lower()
-        if any(pat in kl for pat in ["bias", "bn", "norm", "running"]):
-            low_sens_keys.append(key)
-    return low_sens_keys
+
+        if "running" in kl or "num_batches_tracked" in kl:
+            continue
+
+        if kl.endswith(".bias") or kl == "bias":
+            low.append(key)
+            continue
+
+        if mode == "bias_only":
+            continue
+
+        is_norm_layer = ("bn" in kl) or ("norm" in kl)
+        if is_norm_layer and (kl.endswith(".weight") or kl.endswith(".bias")):
+            low.append(key)
+
+    return low
 
 
 class FedEvoRunner:
@@ -161,6 +173,7 @@ class FedEvoRunner:
         enable_mutation: bool = True,
         enable_orth_injection: bool = True,
         feedback_log_path: Optional[str] = None,
+        low_sens_mode: str = "bias_norm"
     ) -> None:
         self.device = device
         self.m = int(m)
@@ -206,12 +219,22 @@ class FedEvoRunner:
         self.base_params = param_state_dict(base_model)
         self.param_keys = sorted(self.base_params.keys())
 
+        # low-sensitivity mode for sentinel placement
+        if low_sens_mode not in ("bias_only", "bias_norm"):
+            raise ValueError(f"Invalid low_sens_mode: {low_sens_mode}")
+        self.low_sens_mode = low_sens_mode
+
+        # server "base" model parameters (sentinel-free)
+        self.theta_base: Dict[str, torch.Tensor] = _clone_params(self.base_params)
+
+        # orthogonal injection keys (depends only on param keys)
         self._init_orth_keys()
 
-        self.low_sens_keys = _get_low_sensitivity_keys(self.base_params)
+        # sentinel placement pool (depends on theta_base + low_sens_mode)
+        self.low_sens_keys = _get_low_sensitivity_keys(self.theta_base, self.low_sens_mode)
         self._build_low_sens_index_pool()
 
-        self.theta_base: Dict[str, torch.Tensor] = _clone_params(self.base_params)
+        # choose sentinel magnitude nu after pool exists
         self._compute_nu(self.theta_base)
 
         self.pop_raw: List[Dict[str, torch.Tensor]] = [
@@ -250,8 +273,9 @@ class FedEvoRunner:
             self.orth_keys = [self.param_keys[i] for i in sorted(indices)]
 
     def _compute_nu(self, ref_params: Dict[str, torch.Tensor]) -> None:
-        if len(self.low_sens_pool) == 0:
+        if len(self.low_sens_pool) == 0:    
             self.nu = self.nu_min
+            print(f"[FedEvo] nu_scale={self.nu_scale} -> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.3e})")
             return
 
         values: List[float] = []
@@ -268,34 +292,41 @@ class FedEvoRunner:
             raw_nu = self.nu_scale * 0.01
 
         self.nu = float(np.clip(raw_nu, self.nu_min, self.nu_max))
+        print(
+            f"[FedEvo] nu_scale={self.nu_scale} std={std:.3e} raw_nu={raw_nu:.3e} "
+            f"-> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.3e}) "
+            f"[pool={len(self.low_sens_pool)} sample_n={len(values)}]"
+        )
+
 
     def _build_low_sens_index_pool(self) -> None:
+        """Build a flat pool of (param_key, flat_index) coordinates for sentinel embedding.
+
+        This pool is derived from *trainable parameters only* (self.base_params), restricted by
+        self.low_sens_keys. We require pool size >= m*d so each candidate can receive d unique
+        sentinel coordinates without reuse.
+        """
         self.low_sens_pool: List[Tuple[str, int]] = []
         for key in self.low_sens_keys:
-            if key in self.base_params:
-                numel = self.base_params[key].numel()
-                self.low_sens_pool.extend([(key, i) for i in range(numel)])
+            if key not in self.base_params:
+                continue
+            numel = self.base_params[key].numel()
+            self.low_sens_pool.extend([(key, i) for i in range(numel)])
 
         need = self.m * self.d
-        if len(self.low_sens_pool) >= need:
-            return
+        print(
+            f"[FedEvo] low_sens_mode={self.low_sens_mode} "
+            f"low_sens_keys={len(self.low_sens_keys)}, "
+            f"low_sens_pool={len(self.low_sens_pool)}, need={need}"
+        )
 
-        fc_key = None
-        for key in self.param_keys:
-            kl = key.lower()
-            if "fc" in kl and "weight" in kl:
-                fc_key = key
-                break
+        if len(self.low_sens_pool) < need:
+            raise ValueError(
+                f"[FedEvo] Low-sensitivity pool too small: {len(self.low_sens_pool)} < need={need}. "
+                f"Try: (1) decrease d, (2) increase model capacity (more bias/norm params), "
+                f"or (3) relax low-sens filter (e.g., bias_norm)."
+            )
 
-        if fc_key and self.base_params[fc_key].numel() >= need:
-            warnings.warn(f"Low-sens pool insufficient; using {fc_key} as fallback.")
-            self.low_sens_pool = [(fc_key, i) for i in range(self.base_params[fc_key].numel())]
-            return
-
-        warnings.warn("Low-sens pool insufficient; using ALL params.")
-        self.low_sens_pool = []
-        for key in self.param_keys:
-            self.low_sens_pool.extend([(key, i) for i in range(self.base_params[key].numel())])
 
     def _refresh_sentinels(self) -> None:
         if not self.enable_sentinels:
@@ -329,7 +360,7 @@ class FedEvoRunner:
                     w = self.pop_sent[j][key]
                     w_flat = w.reshape(-1)
                     if flat_idx < w_flat.numel():
-                        w_flat[flat_idx] += w_j[idx].to(w_flat.dtype)
+                        w_flat[flat_idx] = w_j[idx].to(w_flat.dtype)
 
     def _embed_all_sentinels(self) -> None:
         if self.pop_sent is None or not self.enable_sentinels:
@@ -347,6 +378,36 @@ class FedEvoRunner:
             else:
                 values.append(0.0)
         return torch.tensor(values, device=self.device, dtype=torch.float32)
+
+
+    def _lift_delta_sent_to_raw(self, delta_sent: Dict[str, torch.Tensor], j_hat: int) -> Dict[str, torch.Tensor]:
+        """Convert delta w.r.t. pop_sent[j_hat] into delta w.r.t. pop_raw[j_hat].
+
+        Paper protocol (Eq.3) defines delta_sent = local - pop_sent[j*].
+        Our evolution state is sentinel-free pop_raw. Since pop_sent[j] is pop_raw[j] with
+        overwritten sentinel coordinates (Eq.4), we can recover:
+            delta_raw = local - pop_raw[j] = delta_sent + (pop_sent[j] - pop_raw[j])
+        where the offset is non-zero only on sentinel indices I_j.
+        """
+        delta_raw: Dict[str, torch.Tensor] = {k: v.detach().clone() for k, v in delta_sent.items()}
+        if (self.pop_sent is None) or (not self.enable_sentinels):
+            return delta_raw
+
+        I_j = self.sentinel_indices[j_hat]
+        with torch.no_grad():
+            for (key, flat_idx) in I_j:
+                if key not in delta_raw:
+                    continue
+                # offset = pop_sent - pop_raw at sentinel coords (overwrite => non-zero only here)
+                ps = self.pop_sent[j_hat][key].reshape(-1).float()
+                pr = self.pop_raw[j_hat][key].reshape(-1).float()
+                if flat_idx >= ps.numel() or flat_idx >= pr.numel():
+                    continue
+                off = (ps[flat_idx] - pr[flat_idx]).to(delta_raw[key].dtype)
+                dflat = delta_raw[key].reshape(-1)
+                if flat_idx < dflat.numel():
+                    dflat[flat_idx] += off
+        return delta_raw
 
     def _attribute(self, delta: Dict[str, torch.Tensor]) -> Tuple[int, float]:
         if not self.enable_sentinels:
@@ -416,14 +477,16 @@ class FedEvoRunner:
         self._refresh_sentinels()
         self._embed_all_sentinels()
 
-        all_deltas: List[Dict[str, torch.Tensor]] = []
+        all_deltas_sent: List[Dict[str, torch.Tensor]] = []  # deltas uploaded by clients (Eq.3)
+        all_deltas_raw: List[Dict[str, torch.Tensor]] = []   # deltas lifted to pop_raw coordinates for evolution
         all_local_params: List[Dict[str, torch.Tensor]] = []
         all_sample_counts: List[int] = []
 
         S_j: List[Set[int]] = [set() for _ in range(self.m)]
         train_losses: List[float] = []
         uplink_bytes = 0
-        client_to_delta: Dict[int, Dict[str, torch.Tensor]] = {}
+        client_to_delta_sent: Dict[int, Dict[str, torch.Tensor]] = {}
+        client_to_delta_raw: Dict[int, Dict[str, torch.Tensor]] = {}
 
         round_correct = 0
         round_total = 0
@@ -455,21 +518,27 @@ class FedEvoRunner:
             local_params = param_state_dict(local_model)
             all_local_params.append(local_params)
 
-            # Delta w.r.t. SENTINEL-FREE base (client trained on pop_sent[j_star])
-            # local ≈ pop_raw + sentinel + training_update
-            # so (local - pop_raw) exposes sentinel
-            delta = {
-                k: (local_params[k].float() - self.pop_raw[j_star][k].float()).to(local_params[k].dtype)
+            # Client upload delta per paper Eq.(3): delta_sent = local - pop_sent[j*]
+            delta_sent = {
+                k: (local_params[k].float() - self.pop_sent[j_star][k].float()).to(local_params[k].dtype)
                 for k in self.param_keys
             }
 
-            uplink_bytes += uplink_bytes_for_delta(delta)
+            # Uplink cost matches FedAvg: client sends only one delta (no IDs / losses)
+            uplink_bytes += uplink_bytes_for_delta(delta_sent)
 
-            all_deltas.append(delta)
-            client_to_delta[cid_int] = delta
-
-            j_attr, margin = self._attribute(delta)
+            # Server-side attribution per Eq.(5) using sentinel slices from delta_sent
+            j_attr, margin = self._attribute(delta_sent)
             S_j[j_attr].add(cid_int)
+
+            # For evolution we keep a sentinel-free state (pop_raw).
+            # Lift delta_sent (w.r.t. pop_sent[j_star]) back to pop_raw[j_star] coordinates.
+            delta_raw = self._lift_delta_sent_to_raw(delta_sent, j_star)
+
+            all_deltas_sent.append(delta_sent)
+            all_deltas_raw.append(delta_raw)
+            client_to_delta_sent[cid_int] = delta_sent
+            client_to_delta_raw[cid_int] = delta_raw
 
             round_total += 1
             round_margins.append(margin)
@@ -485,7 +554,7 @@ class FedEvoRunner:
             if len(S_j[j]) == 0:
                 theta_bars.append(_clone_params(self.pop_raw[j]))
             else:
-                deltas_j = [client_to_delta[k] for k in S_j[j]]
+                deltas_j = [client_to_delta_raw[k] for k in S_j[j]]
                 avg_delta = _avg_params(deltas_j)
                 theta_bars.append(_add_params(self.pop_raw[j], avg_delta))
 
@@ -495,24 +564,26 @@ class FedEvoRunner:
         usage_counts = np.array([len(s) for s in S_j], dtype=np.int64)
 
         # Stabilizer: average of local final params (optionally sample-weighted)
-        if len(all_local_params) > 0:
+        if len(all_deltas_raw) > 0:
+            # Paper Eq.(7): stabilizer is base plus mean client delta (delta-only uplink)
             if self.weight_by_samples:
-                theta_stab = _avg_params(all_local_params, weights=[float(n) for n in all_sample_counts])
+                delta_bar = _avg_params(all_deltas_raw, weights=[float(n) for n in all_sample_counts])
             else:
-                theta_stab = _avg_params(all_local_params)
+                delta_bar = _avg_params(all_deltas_raw)
+            theta_stab = _add_params(self.theta_base, delta_bar, scale=1.0)
         else:
             theta_stab = _clone_params(self.theta_base)
 
         used_bars = [theta_bars[j] for j in range(self.m) if len(S_j[j]) > 0]
         theta_used = _avg_params(used_bars) if len(used_bars) > 0 else _clone_params(theta_stab)
 
-        self._evolve(theta_bars, theta_stab, theta_used, p_j, H_t, usage_counts, all_deltas)
+        self._evolve(theta_bars, theta_stab, theta_used, p_j, H_t, usage_counts, all_deltas_raw)
 
         # Persist only sentinel-free base
         self.theta_base = _clone_params(theta_stab)
 
         # Cache deltas for population seeding
-        self.cached_deltas = all_deltas.copy()
+        self.cached_deltas = all_deltas_raw.copy()
         max_cache = self.m * self.k
         if len(self.cached_deltas) > max_cache:
             self.cached_deltas = self.cached_deltas[-max_cache:]
@@ -549,7 +620,7 @@ class FedEvoRunner:
         p_j: np.ndarray,
         H_t: float,
         usage_counts: np.ndarray,
-        all_deltas: List[Dict[str, torch.Tensor]],
+        all_deltas_raw: List[Dict[str, torch.Tensor]],
     ) -> None:
         order_asc = np.argsort(usage_counts)
 
@@ -629,8 +700,8 @@ class FedEvoRunner:
                 if cos < min_cos:
                     min_cos, j_orth = cos, j
 
-            if len(all_deltas) > 0:
-                delta_bar = _avg_params(all_deltas)
+            if len(all_deltas_raw) > 0:
+                delta_bar = _avg_params(all_deltas_raw)
                 theta_orth = _add_params(theta_bars[j_orth], delta_bar, scale=1.0)
             else:
                 theta_orth = _clone_params(theta_bars[j_orth])
@@ -663,6 +734,8 @@ class FedEvoRunner:
 
     def _apply_mutation(self, slots: List[CandidateSlot], usage_counts: np.ndarray) -> None:
         all_keys = self.param_keys.copy()
+        # Mutate a subset of parameter tensors to avoid destabilizing training.
+        # We use ~1/3 of tensors as a conservative default (ablation-friendly).
         num_layers_to_mutate = max(1, len(all_keys) // 3)
 
         m = int(len(usage_counts))
@@ -755,7 +828,8 @@ class FedEvoRunner:
                 total_loss += float(loss.item()) * bs
                 total_samples += bs
         if total_samples == 0:
-            # epochs=0 스모크 테스트 등에서 가중치가 0이 되어 평균이 터지는 걸 방지
+            # Prevent division-by-zero when epochs=0 (smoke tests) yields total_samples=0.
+
             try:
                 total_samples = int(len(loader.dataset))
             except Exception:
@@ -770,3 +844,4 @@ class FedEvoRunner:
 
     def get_attribution_accuracy(self) -> float:
         return self.attribution_correct_total / max(1, self.attribution_total_total)
+    
