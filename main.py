@@ -153,7 +153,7 @@ def main() -> None:
         seed_evo=2025,
         nu_scale=args.nu_scale,
         nu_min=1e-6,
-        nu_max=5e-2,
+        nu_max=1e-1,
         feedback_log_path="logs/implicit_feedback.csv",
         low_sens_mode=args.low_sens_mode,   # ← (fedevo.py가 이 인자 받으면 사용)
     )

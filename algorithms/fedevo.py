@@ -19,7 +19,7 @@ Implementation notes (paper-unspecified choices)
 - Interp parents: top-k by usage (design choice).
 - Soft elitism: bottom-ζ inserted first; only these are protected.
 - Mutation: targets slots whose source_id is in bottom 50% usage; synthetic excluded.
-- Sentinel: overwrite (θ[I_j] ← w_j); ν clamped to [nu_min, nu_max].
+- Sentinel: overwrite (θ[I_j] ← w_j) per Eq.(4); ν clamped to [nu_min, nu_max].
 - Stabilizer: sample-weighted average of local final params (FedAvg style, default).
 - Attribution logging: round & cumulative accuracy + margin (mean, p50, p90).
 - Perf options: val_batches, recompute_nu_each_round, orth_subset_ratio, reuse_local_model.
@@ -39,6 +39,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_EPS = 1e-12
+
+def _l2(x: torch.Tensor) -> float:
+    # robust L2 norm as python float
+    return float(x.detach().norm(p=2).item())
+
+def _safe_div(a: float, b: float, eps: float = _EPS) -> float:
+    return a / (b + eps)
+
+
 from .base import (
     load_param_state_dict_,
     param_state_dict,
@@ -54,10 +64,11 @@ class CandidateSlot:
 
 
 def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
-    # Overwrite(PDF) mode: with overwrite embedding, the paper's attribution
-    # is based on minimizing ||Δθ[I_j] + w_j||_2^2 (Eq.5).
+    # Paper Eq.(5): score_j(Δθ) = || Δθ[I_j] + w_j ||_2^2
+    # Here delta_slice corresponds to Δθ[I_j] (computed w.r.t. received pop_sent).
     diff = delta_slice + w_j
     return float(diff.norm().pow(2).item())
+
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -160,7 +171,7 @@ class FedEvoRunner:
         sigma_mut: float = 0.01,
         seed_evo: int = 777,
         nu_min: float = 1e-6,
-        nu_max: float = 1e-3,
+        nu_max: float = 1e-1,
         val_batches: Optional[int] = None,
         recompute_nu_each_round: bool = False,
         orth_subset_ratio: float = 1.0,
@@ -409,6 +420,21 @@ class FedEvoRunner:
                     dflat[flat_idx] += off
         return delta_raw
 
+
+    def _scores_for_delta(self, delta: Dict[str, torch.Tensor]) -> List[float]:
+        """Compute attribution scores for all candidates (same as _attribute, but returns full list)."""
+        scores: List[float] = []
+        for j in range(self.m):
+            delta_slice = self._extract_delta_slice(delta, j)
+            w_j = self.sentinel_values[j]
+            min_len = min(delta_slice.numel(), w_j.numel())
+            if min_len == 0:
+                scores.append(float("inf"))
+            else:
+                scores.append(_l2_score(delta_slice[:min_len], w_j[:min_len]))
+        return scores
+
+
     def _attribute(self, delta: Dict[str, torch.Tensor]) -> Tuple[int, float]:
         if not self.enable_sentinels:
             # Ablation: sentinel off => attribution collapses (all routed to 0)
@@ -531,9 +557,70 @@ class FedEvoRunner:
             j_attr, margin = self._attribute(delta_sent)
             S_j[j_attr].add(cid_int)
 
+            # # ---- begin: extra ATTR diagnostics (SNR / cancellation / gap_rel) ----
+            # try:
+            #     scores = self._scores_for_delta(delta_sent)
+
+            #     j_true = int(j_star)
+            #     j_pick = int(j_attr)
+
+            #     # r_min and r_2nd (need stable ordering)
+            #     sorted_scores = sorted(scores)
+            #     r_min = float(sorted_scores[0])
+            #     r_2nd = float(sorted_scores[1]) if len(sorted_scores) > 1 else float("inf")
+            #     gap = float(r_2nd - r_min)
+
+            #     r_star = float(scores[j_true])  # score for the ground-truth selected model
+
+            #     # delta slices + w vectors for true and picked
+            #     delta_true = self._extract_delta_slice(delta_sent, j_true).float()
+            #     w_true = self.sentinel_values[j_true].float()
+            #     min_len_true = min(delta_true.numel(), w_true.numel())
+            #     delta_true = delta_true[:min_len_true]
+            #     w_true = w_true[:min_len_true]
+
+            #     delta_pick = self._extract_delta_slice(delta_sent, j_pick).float()
+            #     w_pick = self.sentinel_values[j_pick].float()
+            #     min_len_pick = min(delta_pick.numel(), w_pick.numel())
+            #     delta_pick = delta_pick[:min_len_pick]
+            #     w_pick = w_pick[:min_len_pick]
+
+            #     # norms
+            #     a_true = _l2(delta_true)                 # ||Δ[I_true]||
+            #     b_true = _l2(w_true)                     # ||w_true||
+            #     res_true = _l2(delta_true + w_true)      # ||Δ + w||
+            #     rho_true = _safe_div(a_true, b_true)     # SNR-ish: Δ magnitude vs w magnitude
+            #     kappa_true = _safe_div(res_true, a_true + b_true)  # cancellation quality (0 best)
+
+            #     a_pick = _l2(delta_pick)
+            #     b_pick = _l2(w_pick)
+            #     res_pick = _l2(delta_pick + w_pick)
+            #     rho_pick = _safe_div(a_pick, b_pick)
+            #     kappa_pick = _safe_div(res_pick, a_pick + b_pick)
+
+            #     gap_rel = _safe_div(gap, r_min)
+
+            #     print(
+            #         f"[ATTR_DIAG] j_star={j_true} j_attr={j_pick} "
+            #         f"r_star={r_star:.3e} r_min={r_min:.3e} r_2nd={r_2nd:.3e} gap={gap:.3e}"
+            #     )
+            #     print(
+            #         f"[ATTR_SNR] true(j={j_true}) |d|={a_true:.3e} |w|={b_true:.3e} |d+w|={res_true:.3e} "
+            #         f"rho={rho_true:.2f} kappa={kappa_true:.3f} || "
+            #         f"pick(j={j_pick}) |d|={a_pick:.3e} |w|={b_pick:.3e} |d+w|={res_pick:.3e} "
+            #         f"rho={rho_pick:.2f} kappa={kappa_pick:.3f}"
+            #     )
+            #     print(
+            #         f"[ATTR_GAP] gap_rel={gap_rel:.3e} (gap={gap:.3e}, r_min={r_min:.3e}, r_2nd={r_2nd:.3e})"
+            #     )
+            # except Exception as e:
+            #     print(f"[ATTR_DIAG_ERR] {type(e).__name__}: {e}")
+            # # ---- end: extra ATTR diagnostics ----
+
+
             # For evolution we keep a sentinel-free state (pop_raw).
-            # Lift delta_sent (w.r.t. pop_sent[j_star]) back to pop_raw[j_star] coordinates.
-            delta_raw = self._lift_delta_sent_to_raw(delta_sent, j_star)
+            # Lift delta_sent (w.r.t. pop_sent[j_attr]) back to pop_raw[j_attr] coordinates.
+            delta_raw = self._lift_delta_sent_to_raw(delta_sent, j_attr)
 
             all_deltas_sent.append(delta_sent)
             all_deltas_raw.append(delta_raw)
@@ -734,8 +821,6 @@ class FedEvoRunner:
 
     def _apply_mutation(self, slots: List[CandidateSlot], usage_counts: np.ndarray) -> None:
         all_keys = self.param_keys.copy()
-        # Mutate a subset of parameter tensors to avoid destabilizing training.
-        # We use ~1/3 of tensors as a conservative default (ablation-friendly).
         num_layers_to_mutate = max(1, len(all_keys) // 3)
 
         m = int(len(usage_counts))
@@ -828,8 +913,7 @@ class FedEvoRunner:
                 total_loss += float(loss.item()) * bs
                 total_samples += bs
         if total_samples == 0:
-            # Prevent division-by-zero when epochs=0 (smoke tests) yields total_samples=0.
-
+            # epochs=0 스모크 테스트 등에서 가중치가 0이 되어 평균이 터지는 걸 방지
             try:
                 total_samples = int(len(loader.dataset))
             except Exception:

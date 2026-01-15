@@ -141,14 +141,28 @@ def _score_metrics(
     H: float,
     margin_target_low: float = 1e-3,
     margin_target_high: float = 1e-2,
+    target_attr: float = 0.95,
 ) -> float:
     """
-    Objective:
-    - margin_mean in [1e-3, 1e-2]
-    - increase attribution
-    - keep entropy non-collapsing (soft)
+    Objective (paper-aligned but attr-prioritized):
+    1) Primary: push attribution up (round + cumulative)
+    2) Secondary: encourage separation (margin) into [1e-3, 1e-2]
+    3) Soft: avoid entropy collapse
     """
+
+    # Primary: attribution dominates
+    attr = 0.6 * attr_r + 0.4 * attr_c  # round slightly more important for tuning
+
+    # If we're already near target, give a big bonus (helps search converge)
+    bonus = 0.0
+    if attr_r >= target_attr:
+        bonus += 5.0
+    if attr_c >= target_attr:
+        bonus += 2.0
+
+    # Secondary: margin reward (log-scale)
     eps = 1e-12
+    import math
     logm = math.log10(max(margin_mean, eps))
     log_lo = math.log10(margin_target_low)
     log_hi = math.log10(margin_target_high)
@@ -159,12 +173,11 @@ def _score_metrics(
         dist = min(abs(logm - log_lo), abs(logm - log_hi))
         margin_reward = max(0.0, 1.0 - dist / 2.0)  # 2 decades away -> ~0
 
-    # m=5 => H in [0, ln(5)~1.609]. Prefer around ~1.0 (not too collapsed)
+    # Soft: entropy preference (m=5 => H in [0, ln5≈1.609])
     H_pref = max(0.0, 1.0 - abs(H - 1.0) / 1.5)
 
-    attr_reward = 0.5 * (attr_r + attr_c)  # 0..1
-
-    return 3.0 * margin_reward + 2.0 * attr_reward + 0.5 * H_pref
+    # Weighting: attr >> margin >> entropy
+    return (10.0 * attr) + (2.0 * margin_reward) + (0.5 * H_pref) + bonus
 
 
 def _build_cmd(
@@ -344,16 +357,24 @@ def run_trial(
 # -----------------------------
 def generate_space(dataset: str, alpha: float, data_dir: str, rounds: int, seed_train: int) -> List[TrialConfig]:
     """
-    Practical heuristic:
-    - local_steps 1..2 first (sentinel survives; separation first)
-    - bias_only then bias_norm
-    - d: moderate -> larger (but bias_only will auto-cap if too large)
-    - nu_scale: small -> larger
+    Heuristic search space (root-cause aligned):
+    - First reduce local_steps to preserve sentinel signal.
+    - Try bias_only first to reduce update magnitude on sentinel coords.
+    - Sweep nu_scale wider (you clamp nu elsewhere, so safe).
+    - d: start moderate; larger only if pool allows (bias_only auto-cap already implemented).
     """
-    local_steps_list = [1, 2]
+
+    # 1) local training strength: most important for sentinel survival
+    local_steps_list = [1, 2, 3]  # try small first
+
+    # 2) low-sensitivity mode: bias_only first, then bias_norm
     modes = ["bias_only", "bias_norm"]
-    d_list = [512, 1024, 1536, 2048]
-    nu_list = [0.005, 0.01, 0.02, 0.05, 0.08, 0.12]
+
+    # 3) sentinel dimension: moderate first, then larger
+    d_list = [256, 512, 768, 1024, 1536]
+
+    # 4) sentinel amplitude scaling: include lower + higher
+    nu_list = [0.002, 0.005, 0.01, 0.02, 0.05, 0.08, 0.12]
 
     out: List[TrialConfig] = []
     for steps in local_steps_list:
