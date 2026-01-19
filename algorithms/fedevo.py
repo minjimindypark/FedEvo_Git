@@ -286,7 +286,7 @@ class FedEvoRunner:
     def _compute_nu(self, ref_params: Dict[str, torch.Tensor]) -> None:
         if len(self.low_sens_pool) == 0:    
             self.nu = self.nu_min
-            print(f"[FedEvo] nu_scale={self.nu_scale} -> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.3e})")
+            print(f"[FedEvo] nu_scale={self.nu_scale} -> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.1e})")
             return
 
         values: List[float] = []
@@ -305,7 +305,7 @@ class FedEvoRunner:
         self.nu = float(np.clip(raw_nu, self.nu_min, self.nu_max))
         print(
             f"[FedEvo] nu_scale={self.nu_scale} std={std:.3e} raw_nu={raw_nu:.3e} "
-            f"-> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.3e}) "
+            f"-> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.1e}) "
             f"[pool={len(self.low_sens_pool)} sample_n={len(values)}]"
         )
 
@@ -556,66 +556,6 @@ class FedEvoRunner:
             # Server-side attribution per Eq.(5) using sentinel slices from delta_sent
             j_attr, margin = self._attribute(delta_sent)
             S_j[j_attr].add(cid_int)
-
-            # # ---- begin: extra ATTR diagnostics (SNR / cancellation / gap_rel) ----
-            # try:
-            #     scores = self._scores_for_delta(delta_sent)
-
-            #     j_true = int(j_star)
-            #     j_pick = int(j_attr)
-
-            #     # r_min and r_2nd (need stable ordering)
-            #     sorted_scores = sorted(scores)
-            #     r_min = float(sorted_scores[0])
-            #     r_2nd = float(sorted_scores[1]) if len(sorted_scores) > 1 else float("inf")
-            #     gap = float(r_2nd - r_min)
-
-            #     r_star = float(scores[j_true])  # score for the ground-truth selected model
-
-            #     # delta slices + w vectors for true and picked
-            #     delta_true = self._extract_delta_slice(delta_sent, j_true).float()
-            #     w_true = self.sentinel_values[j_true].float()
-            #     min_len_true = min(delta_true.numel(), w_true.numel())
-            #     delta_true = delta_true[:min_len_true]
-            #     w_true = w_true[:min_len_true]
-
-            #     delta_pick = self._extract_delta_slice(delta_sent, j_pick).float()
-            #     w_pick = self.sentinel_values[j_pick].float()
-            #     min_len_pick = min(delta_pick.numel(), w_pick.numel())
-            #     delta_pick = delta_pick[:min_len_pick]
-            #     w_pick = w_pick[:min_len_pick]
-
-            #     # norms
-            #     a_true = _l2(delta_true)                 # ||Δ[I_true]||
-            #     b_true = _l2(w_true)                     # ||w_true||
-            #     res_true = _l2(delta_true + w_true)      # ||Δ + w||
-            #     rho_true = _safe_div(a_true, b_true)     # SNR-ish: Δ magnitude vs w magnitude
-            #     kappa_true = _safe_div(res_true, a_true + b_true)  # cancellation quality (0 best)
-
-            #     a_pick = _l2(delta_pick)
-            #     b_pick = _l2(w_pick)
-            #     res_pick = _l2(delta_pick + w_pick)
-            #     rho_pick = _safe_div(a_pick, b_pick)
-            #     kappa_pick = _safe_div(res_pick, a_pick + b_pick)
-
-            #     gap_rel = _safe_div(gap, r_min)
-
-            #     print(
-            #         f"[ATTR_DIAG] j_star={j_true} j_attr={j_pick} "
-            #         f"r_star={r_star:.3e} r_min={r_min:.3e} r_2nd={r_2nd:.3e} gap={gap:.3e}"
-            #     )
-            #     print(
-            #         f"[ATTR_SNR] true(j={j_true}) |d|={a_true:.3e} |w|={b_true:.3e} |d+w|={res_true:.3e} "
-            #         f"rho={rho_true:.2f} kappa={kappa_true:.3f} || "
-            #         f"pick(j={j_pick}) |d|={a_pick:.3e} |w|={b_pick:.3e} |d+w|={res_pick:.3e} "
-            #         f"rho={rho_pick:.2f} kappa={kappa_pick:.3f}"
-            #     )
-            #     print(
-            #         f"[ATTR_GAP] gap_rel={gap_rel:.3e} (gap={gap:.3e}, r_min={r_min:.3e}, r_2nd={r_2nd:.3e})"
-            #     )
-            # except Exception as e:
-            #     print(f"[ATTR_DIAG_ERR] {type(e).__name__}: {e}")
-            # # ---- end: extra ATTR diagnostics ----
 
 
             # For evolution we keep a sentinel-free state (pop_raw).
