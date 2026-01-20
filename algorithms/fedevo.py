@@ -19,7 +19,7 @@ Implementation notes (paper-unspecified choices)
 - Interp parents: top-k by usage (design choice).
 - Soft elitism: bottom-ζ inserted first; only these are protected.
 - Mutation: targets slots whose source_id is in bottom 50% usage; synthetic excluded.
-- Sentinel: overwrite (θ[I_j] ← w_j) per Eq.(4); ν clamped to [nu_min, nu_max].
+- Sentinel: additive (θ[I_j] ← θ[I_j] + w_j); ν clamped to [nu_min, nu_max].
 - Stabilizer: sample-weighted average of local final params (FedAvg style, default).
 - Attribution logging: round & cumulative accuracy + margin (mean, p50, p90).
 - Perf options: val_batches, recompute_nu_each_round, orth_subset_ratio, reuse_local_model.
@@ -64,11 +64,9 @@ class CandidateSlot:
 
 
 def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
-    # Paper Eq.(5): score_j(Δθ) = || Δθ[I_j] + w_j ||_2^2
-    # Here delta_slice corresponds to Δθ[I_j] (computed w.r.t. received pop_sent).
+    # Paper Eq.(5): score_j(Δθ) = || Δθ[I_j] + w_j ||_2
     diff = delta_slice + w_j
-    return float(diff.norm().pow(2).item())
-
+    return float(diff.norm(p=2).item())
 
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -167,7 +165,9 @@ class FedEvoRunner:
         d: int = 64,
         nu_scale: float = 0.005,
         tau_factor: float = 0.8,
-        zeta: int = 1,
+        # m=5 환경에서는 zeta=1이 너무 공격적이라 희귀 후보(특화 후보)가 쉽게 소거되어
+        # 후보 다양성이 붕괴하고 margin/attribution이 흔들릴 수 있음. 기본값을 2로 상향.
+        zeta: int = 2,
         sigma_mut: float = 0.01,
         seed_evo: int = 777,
         nu_min: float = 1e-6,
@@ -183,6 +183,15 @@ class FedEvoRunner:
         enable_sentinels: bool = True,
         enable_mutation: bool = True,
         enable_orth_injection: bool = True,
+        # --- Stability gates (paper-unspecified, but necessary in practice) ---
+        # Mutation is powerful but can amplify wrong routing when attribution confidence is low.
+        # We therefore gate mutation by:
+        #   (1) warmup rounds (avoid early noisy dynamics), and
+        #   (2) margin_p50 threshold (only mutate when attribution is confident).
+        # Empirically (your CIFAR10 run, d=1536, nu_scale=0.1, local_steps=5),
+        # margin_p50 around 0.002 was a clean separator between good/bad attr rounds.
+        mut_warmup_rounds: int = 6,
+        mut_margin_p50_min: float = 0.002,
         feedback_log_path: Optional[str] = None,
         low_sens_mode: str = "bias_norm"
     ) -> None:
@@ -213,6 +222,11 @@ class FedEvoRunner:
         self.enable_sentinels = enable_sentinels
         self.enable_mutation = enable_mutation
         self.enable_orth_injection = enable_orth_injection
+        self.mut_warmup_rounds = int(mut_warmup_rounds)
+        self.mut_margin_p50_min = float(mut_margin_p50_min)
+
+        # last-round diagnostics (used for gating/logging)
+        self.last_margin_p50: float = 0.0
 
         if self.deterministic:
             # Determinism flags (still not perfect across all ops, but much better)
@@ -371,7 +385,9 @@ class FedEvoRunner:
                     w = self.pop_sent[j][key]
                     w_flat = w.reshape(-1)
                     if flat_idx < w_flat.numel():
-                        w_flat[flat_idx] = w_j[idx].to(w_flat.dtype)
+                        # Additive sentinel embedding (empirically more stable than overwrite):
+                        #   pop_sent[j][I_j] = pop_raw[j][I_j] + w_j
+                        w_flat[flat_idx] += w_j[idx].to(w_flat.dtype)
 
     def _embed_all_sentinels(self) -> None:
         if self.pop_sent is None or not self.enable_sentinels:
@@ -396,7 +412,7 @@ class FedEvoRunner:
 
         Paper protocol (Eq.3) defines delta_sent = local - pop_sent[j*].
         Our evolution state is sentinel-free pop_raw. Since pop_sent[j] is pop_raw[j] with
-        overwritten sentinel coordinates (Eq.4), we can recover:
+        additive sentinels on I_j (Eq.4-style embedding), we can recover:
             delta_raw = local - pop_raw[j] = delta_sent + (pop_sent[j] - pop_raw[j])
         where the offset is non-zero only on sentinel indices I_j.
         """
@@ -409,7 +425,7 @@ class FedEvoRunner:
             for (key, flat_idx) in I_j:
                 if key not in delta_raw:
                     continue
-                # offset = pop_sent - pop_raw at sentinel coords (overwrite => non-zero only here)
+                # offset = pop_sent - pop_raw at sentinel coords (additive => non-zero only here)
                 ps = self.pop_sent[j_hat][key].reshape(-1).float()
                 pr = self.pop_raw[j_hat][key].reshape(-1).float()
                 if flat_idx >= ps.numel() or flat_idx >= pr.numel():
@@ -456,6 +472,24 @@ class FedEvoRunner:
         margin = float("inf") if len(sorted_scores) < 2 else float(sorted_scores[1] - sorted_scores[0])
         return best_j, margin
 
+    def _should_mutate(self, H_t: float, margin_p50: float) -> bool:
+        """Return True if mutation is allowed this round.
+
+        Rationale:
+        - Paper gate: mutate when entropy is low (H_t < tau).
+        - Practical stability: additionally require attribution confidence (margin_p50 high enough)
+          and avoid the first few warmup rounds.
+        """
+        if not self.enable_mutation:
+            return False
+        if self.round_idx < self.mut_warmup_rounds:
+            return False
+        if not (H_t < self.tau):
+            return False
+        if margin_p50 < self.mut_margin_p50_min:
+            return False
+        return True
+
     def _seed_population(self) -> None:
         warm_deltas = self.cached_deltas.copy()
         if len(warm_deltas) == 0:
@@ -488,7 +522,7 @@ class FedEvoRunner:
         self.round_idx += 1
         St = list(client_ids)
 
-        # Seeding policy (paper-strict vs continuity)
+        # Seeding policy
         if self.seed_every_round or self.round_idx == 1:
             self._seed_population()
 
@@ -554,13 +588,13 @@ class FedEvoRunner:
             uplink_bytes += uplink_bytes_for_delta(delta_sent)
 
             # Server-side attribution per Eq.(5) using sentinel slices from delta_sent
-            j_attr, margin = self._attribute(delta_sent)
-            S_j[j_attr].add(cid_int)
+            j_hat, margin = self._attribute(delta_sent)
+            S_j[j_hat].add(cid_int)
 
 
             # For evolution we keep a sentinel-free state (pop_raw).
-            # Lift delta_sent (w.r.t. pop_sent[j_attr]) back to pop_raw[j_attr] coordinates.
-            delta_raw = self._lift_delta_sent_to_raw(delta_sent, j_attr)
+            # Lift delta_sent (w.r.t. pop_sent[j_hat]) back to pop_raw[j_hat] coordinates.
+            delta_raw = self._lift_delta_sent_to_raw(delta_sent, j_hat)
 
             all_deltas_sent.append(delta_sent)
             all_deltas_raw.append(delta_raw)
@@ -569,8 +603,18 @@ class FedEvoRunner:
 
             round_total += 1
             round_margins.append(margin)
-            if j_attr == j_star:
+            if j_hat == j_star:
                 round_correct += 1
+
+        # Round-level margin stats (used for mutation gating + logging)
+        if round_margins:
+            margin_arr = np.array(round_margins, dtype=np.float64)
+            margin_mean = float(np.mean(margin_arr))
+            margin_p50 = float(np.percentile(margin_arr, 50))
+            margin_p90 = float(np.percentile(margin_arr, 90))
+        else:
+            margin_mean = margin_p50 = margin_p90 = 0.0
+        self.last_margin_p50 = float(margin_p50)
 
         self.attribution_correct_total += round_correct
         self.attribution_total_total += round_total
@@ -604,7 +648,16 @@ class FedEvoRunner:
         used_bars = [theta_bars[j] for j in range(self.m) if len(S_j[j]) > 0]
         theta_used = _avg_params(used_bars) if len(used_bars) > 0 else _clone_params(theta_stab)
 
-        self._evolve(theta_bars, theta_stab, theta_used, p_j, H_t, usage_counts, all_deltas_raw)
+        self._evolve(
+            theta_bars,
+            theta_stab,
+            theta_used,
+            p_j,
+            H_t,
+            usage_counts,
+            all_deltas_raw,
+            margin_p50=float(margin_p50),
+        )
 
         # Persist only sentinel-free base
         self.theta_base = _clone_params(theta_stab)
@@ -621,18 +674,12 @@ class FedEvoRunner:
         attr_acc_round = round_correct / max(1, round_total)
         attr_acc_cum = self.attribution_correct_total / max(1, self.attribution_total_total)
 
-        if round_margins:
-            margin_arr = np.array(round_margins, dtype=np.float64)
-            margin_mean = float(np.mean(margin_arr))
-            margin_p50 = float(np.percentile(margin_arr, 50))
-            margin_p90 = float(np.percentile(margin_arr, 90))
-        else:
-            margin_mean = margin_p50 = margin_p90 = 0.0
+        mut_allowed = self._should_mutate(H_t=H_t, margin_p50=float(margin_p50))
 
         print(
             f"[FedEvo R{self.round_idx}] H={H_t:.3f} τ={self.tau:.3f} "
             f"|S_j|={[len(s) for s in S_j]} "
-            f"mut={'Y' if (H_t < self.tau and self.enable_mutation) else 'N'} "
+            f"mut={'Y' if mut_allowed else 'N'} "
             f"attr_r={attr_acc_round:.3f} attr_c={attr_acc_cum:.3f} "
             f"margin(mean/p50/p90)={margin_mean:.4f}/{margin_p50:.4f}/{margin_p90:.4f}"
         )
@@ -648,6 +695,7 @@ class FedEvoRunner:
         H_t: float,
         usage_counts: np.ndarray,
         all_deltas_raw: List[Dict[str, torch.Tensor]],
+        margin_p50: float,
     ) -> None:
         order_asc = np.argsort(usage_counts)
 
@@ -753,8 +801,8 @@ class FedEvoRunner:
 
         new_slots = new_slots[:capacity]
 
-        # Mutation on low-usage sourced slots only
-        if H_t < self.tau and self.enable_mutation:
+        # Mutation on low-usage sourced slots only, additionally gated by attribution confidence.
+        if self._should_mutate(H_t=float(H_t), margin_p50=float(margin_p50)):
             self._apply_mutation(new_slots, usage_counts)
 
         self.pop_raw = [slot.params for slot in new_slots]
