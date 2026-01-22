@@ -1,513 +1,149 @@
 """
-FedEvo: Genetic Candidate Evolution in Federated Learning
-via Implicit Client Feedback
+algorithms/fedga.py
 
-Key invariants
-- A: pop_raw is always sentinel-free and is the only state persisted across rounds.
-- B: Evolution uses pop_raw as base; sentinels are only for attribution.
+FedGA-FL (IID): Genetic Candidate Evolution for Federated Learning under IID condition
+- Sentinel attribution removed (PDF Sec. 4.3 removed).
+- Non-IID partition removed (IID clients).
+- Focus: genetic operators over a candidate population can improve accuracy vs single-model baselines.
 
-Round flow
-1) Start: pop_sent = clone(pop_raw) → refresh + embed sentinels on pop_sent.
-2) Clients select/train on pop_sent; deltas are w.r.t. pop_sent.
-3) Server attribution uses sentinels; θ̄_j = pop_raw[j] + avg_delta_j (sentinel-free base).
-4) Evolution/mutation produce new sentinel-free pop_raw.
-5) Persist pop_raw only; next round repeats with fresh sentinels.
+Design goals
+- Deterministic-friendly (seeded RNG).
+- Clean separation: client selection + local training + candidate-wise aggregation + GA evolution.
+- No hidden state mixing: population models are always full parameter state_dict clones.
 
-Implementation notes (paper-unspecified choices)
-- Low-sensitivity: keyword heuristic (bias/bn/norm/running). Fallback: fc.weight → all params.
-- Population seeding: configurable (seed_every_round=False for continuity, True for paper-strict).
-- Interp parents: top-k by usage (design choice).
-- Soft elitism: bottom-ζ inserted first; only these are protected.
-- Mutation: targets slots whose source_id is in bottom 50% usage; synthetic excluded.
-- Sentinel: additive (θ[I_j] ← θ[I_j] + w_j); ν clamped to [nu_min, nu_max].
-- Stabilizer: sample-weighted average of local final params (FedAvg style, default).
-- Attribution logging: round & cumulative accuracy + margin (mean, p50, p90).
-- Perf options: val_batches, recompute_nu_each_round, orth_subset_ratio, reuse_local_model.
-- Ablation switches: enable_sentinels, enable_mutation, enable_orth_injection.
+Expected dependencies (already present in your repo):
+- algorithms.base: param_state_dict, load_param_state_dict_, uplink_bytes_for_delta
 """
 
 from __future__ import annotations
 
-import math
-import random
-import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_EPS = 1e-12
-
-def _l2(x: torch.Tensor) -> float:
-    # robust L2 norm as python float
-    return float(x.detach().norm(p=2).item())
-
-def _safe_div(a: float, b: float, eps: float = _EPS) -> float:
-    return a / (b + eps)
-
-
 from .base import (
-    load_param_state_dict_,
     param_state_dict,
+    load_param_state_dict_,
     uplink_bytes_for_delta,
 )
 
-
-@dataclass
-class CandidateSlot:
-    params: Dict[str, torch.Tensor]
-    source_id: Optional[int]
-    is_protected: bool
-
-
-def _l2_score(delta_slice: torch.Tensor, w_j: torch.Tensor) -> float:
-    # Paper Eq.(5): score_j(Δθ) = || Δθ[I_j] + w_j ||_2
-    diff = delta_slice + w_j
-    return float(diff.norm(p=2).item())
-
-
-def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
-    a_flat, b_flat = a.flatten().float(), b.flatten().float()
-    na, nb = a_flat.norm().item(), b_flat.norm().item()
-    if na < 1e-12 or nb < 1e-12:
-        return 0.0
-    return float(F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0), dim=1).item())
-
-
-def _vec(params: Dict[str, torch.Tensor], keys: List[str]) -> torch.Tensor:
-    return torch.cat([params[k].flatten().float() for k in keys])
-
-
-def _avg_params(
-    params_list: List[Dict[str, torch.Tensor]],
-    weights: Optional[List[float]] = None,
-) -> Dict[str, torch.Tensor]:
-    """
-    Weighted average of parameter state dicts.
-    - If weights is None: uniform mean.
-    - If weights provided: normalized to sum to 1.0.
-    """
-    if len(params_list) == 0:
-        raise ValueError("Cannot average empty list")
-    if len(params_list) == 1:
-        return {k: v.clone() for k, v in params_list[0].items()}
-
-    if weights is None:
-        weights = [1.0 / len(params_list)] * len(params_list)
-    else:
-        if len(weights) != len(params_list):
-            raise ValueError("weights length must match params_list length")
-        total = float(sum(weights))
-        if total <= 0.0:
-            raise ValueError("weights must sum to a positive value")
-        weights = [float(w) / total for w in weights]
-
-    result: Dict[str, torch.Tensor] = {}
-    keys = list(params_list[0].keys())
-    for k in keys:
-        weighted_sum = torch.zeros_like(params_list[0][k], dtype=torch.float32)
-        for p, w in zip(params_list, weights):
-            weighted_sum += w * p[k].float()
-        result[k] = weighted_sum.to(params_list[0][k].dtype)
-    return result
-
-
-def _add_params(
-    base: Dict[str, torch.Tensor],
-    delta: Dict[str, torch.Tensor],
-    scale: float = 1.0,
-) -> Dict[str, torch.Tensor]:
-    return {
-        k: (base[k].float() + scale * delta[k].float()).to(base[k].dtype)
-        for k in base.keys()
-    }
+_EPS = 1e-12
 
 
 def _clone_params(params: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {k: v.clone() for k, v in params.items()}
+    return {k: v.detach().clone() for k, v in params.items()}
 
 
-def _get_low_sensitivity_keys(params: Dict[str, torch.Tensor], mode: str) -> List[str]:
-    low: List[str] = []
-    for key in params.keys():
-        kl = key.lower()
+def _avg_state_dicts(
+    sds: List[Dict[str, torch.Tensor]],
+    keys: List[str],
+    weights: Optional[List[float]] = None,
+) -> Dict[str, torch.Tensor]:
+    if len(sds) == 0:
+        raise ValueError("Cannot average empty list")
+    if len(sds) == 1:
+        return _clone_params(sds[0])
 
-        if "running" in kl or "num_batches_tracked" in kl:
-            continue
+    if weights is None:
+        weights = [1.0 / len(sds)] * len(sds)
+    else:
+        if len(weights) != len(sds):
+            raise ValueError("weights length must match number of state_dicts")
+        tot = float(sum(weights))
+        if tot <= 0:
+            raise ValueError("weights must sum to a positive value")
+        weights = [float(w) / tot for w in weights]
 
-        if kl.endswith(".bias") or kl == "bias":
-            low.append(key)
-            continue
+    out: Dict[str, torch.Tensor] = {}
+    ref = sds[0]
+    for k in keys:
+        acc = torch.zeros_like(ref[k], dtype=torch.float32)
+        for sd, w in zip(sds, weights):
+            acc += float(w) * sd[k].float()
+        out[k] = acc.to(ref[k].dtype)
+    return out
 
-        if mode == "bias_only":
-            continue
 
-        is_norm_layer = ("bn" in kl) or ("norm" in kl)
-        if is_norm_layer and (kl.endswith(".weight") or kl.endswith(".bias")):
-            low.append(key)
+def _add_sd(base: Dict[str, torch.Tensor], delta: Dict[str, torch.Tensor], keys: List[str]) -> Dict[str, torch.Tensor]:
+    return {k: (base[k].float() + delta[k].float()).to(base[k].dtype) for k in keys}
 
-    return low
+
+@dataclass
+class GAConfig:
+    m: int = 5              # population size
+    rho: float = 0.4        # top-k ratio for exploitation
+    gamma: float = 1.5      # selection-weight exponent
+    elitism: int = 1        # number of elites carried over
+    lam_low: float = 0.4    # crossover lambda range
+    lam_high: float = 0.6
+    mutate_prob_layer: float = 0.05  # per-layer mutation probability (coarse)
+    sigma_mut: float = 0.01          # mutation scale as fraction of layer std
+    enable_mutation: bool = True
 
 
 class FedEvoRunner:
+    """
+    Genetic Federated Optimization (IID)
+
+    Protocol (round t):
+    1) Server holds population P(t) = {theta_j}.
+    2) Each client selects best candidate by local val loss.
+    3) Client trains locally from that candidate and uploads delta only.
+    4) Server aggregates deltas per candidate to form theta_bar_j.
+    5) Server evolves population using GA operators on {theta_bar_j}.
+    6) For evaluation convenience, server exposes a "best" anchor model (by usage).
+
+    Notes:
+    - This runner intentionally keeps uplink cost identical to FedAvg: one delta per client.
+    - Downlink cost grows with m (population broadcast), same as original FedEvo concept.
+    """
+
     def __init__(
         self,
         model_ctor,
         num_classes: int,
         device: torch.device,
-        m: int = 10,
-        k: int = 5,
-        rho: float = 0.3,
-        gamma: float = 1.5,
-        d: int = 64,
-        nu_scale: float = 0.005,
-        tau_factor: float = 0.8,
-        # m=5 환경에서는 zeta=1이 너무 공격적이라 희귀 후보(특화 후보)가 쉽게 소거되어
-        # 후보 다양성이 붕괴하고 margin/attribution이 흔들릴 수 있음. 기본값을 2로 상향.
-        zeta: int = 2,
-        sigma_mut: float = 0.01,
-        seed_evo: int = 777,
-        nu_min: float = 1e-6,
-        nu_max: float = 1e-1,
+        ga: GAConfig = GAConfig(),
+        seed: int = 42,
         val_batches: Optional[int] = None,
-        recompute_nu_each_round: bool = False,
-        orth_subset_ratio: float = 1.0,
-        resample_orth_keys_each_round: bool = False,
-        reuse_local_model: bool = False,
-        deterministic: bool = False,
         weight_by_samples: bool = True,
-        seed_every_round: bool = False,
-        enable_sentinels: bool = True,
-        enable_mutation: bool = True,
-        enable_orth_injection: bool = True,
-        # --- Stability gates (paper-unspecified, but necessary in practice) ---
-        # Mutation is powerful but can amplify wrong routing when attribution confidence is low.
-        # We therefore gate mutation by:
-        #   (1) warmup rounds (avoid early noisy dynamics), and
-        #   (2) margin_p50 threshold (only mutate when attribution is confident).
-        # Empirically (your CIFAR10 run, d=1536, nu_scale=0.1, local_steps=5),
-        # margin_p50 around 0.002 was a clean separator between good/bad attr rounds.
-        mut_warmup_rounds: int = 6,
-        mut_margin_p50_min: float = 0.002,
-        feedback_log_path: Optional[str] = None,
-        low_sens_mode: str = "bias_norm"
+        deterministic: bool = False,
     ) -> None:
         self.device = device
-        self.m = int(m)
-        self.k = int(k)
-        self.rho = float(rho)
-        self.gamma = float(gamma)
-        self.d = int(d)
-        self.nu_scale = float(nu_scale)
-        self.nu_min = float(nu_min)
-        self.nu_max = float(nu_max)
-        self.tau = float(tau_factor) * math.log(max(2, self.m))
-        self.zeta = int(zeta)
-        self.sigma_mut = float(sigma_mut)
-
-        self.rng = np.random.RandomState(int(seed_evo))
         self.model_ctor = model_ctor
-        self.num_classes = num_classes
+        self.num_classes = int(num_classes)
+        self.ga = ga
         self.val_batches = val_batches
-        self.recompute_nu_each_round = recompute_nu_each_round
-        self.orth_subset_ratio = float(orth_subset_ratio)
-        self.resample_orth_keys_each_round = resample_orth_keys_each_round
-        self.reuse_local_model = reuse_local_model
-        self.deterministic = deterministic
-        self.weight_by_samples = weight_by_samples
-        self.seed_every_round = seed_every_round
-        self.enable_sentinels = enable_sentinels
-        self.enable_mutation = enable_mutation
-        self.enable_orth_injection = enable_orth_injection
-        self.mut_warmup_rounds = int(mut_warmup_rounds)
-        self.mut_margin_p50_min = float(mut_margin_p50_min)
+        self.weight_by_samples = bool(weight_by_samples)
 
-        # last-round diagnostics (used for gating/logging)
-        self.last_margin_p50: float = 0.0
+        self.rng = np.random.RandomState(int(seed))
 
-        if self.deterministic:
-            # Determinism flags (still not perfect across all ops, but much better)
+        if deterministic:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
-
-            # Fix seeds globally for reproducibility
-            random.seed(seed_evo)
-            np.random.seed(seed_evo)
-            torch.manual_seed(seed_evo)
+            torch.manual_seed(int(seed))
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed_evo)
+                torch.cuda.manual_seed_all(int(seed))
 
-        base_model: nn.Module = model_ctor(num_classes).to(device)
-        self.base_params = param_state_dict(base_model)
-        self.param_keys = sorted(self.base_params.keys())
+        base_model: nn.Module = model_ctor(self.num_classes).to(self.device)
+        self.theta_base = param_state_dict(base_model)
+        self.param_keys = sorted(list(self.theta_base.keys()))
 
-        # low-sensitivity mode for sentinel placement
-        if low_sens_mode not in ("bias_only", "bias_norm"):
-            raise ValueError(f"Invalid low_sens_mode: {low_sens_mode}")
-        self.low_sens_mode = low_sens_mode
-
-        # server "base" model parameters (sentinel-free)
-        self.theta_base: Dict[str, torch.Tensor] = _clone_params(self.base_params)
-
-        # orthogonal injection keys (depends only on param keys)
-        self._init_orth_keys()
-
-        # sentinel placement pool (depends on theta_base + low_sens_mode)
-        self.low_sens_keys = _get_low_sensitivity_keys(self.theta_base, self.low_sens_mode)
-        self._build_low_sens_index_pool()
-
-        # choose sentinel magnitude nu after pool exists
-        self._compute_nu(self.theta_base)
-
-        self.pop_raw: List[Dict[str, torch.Tensor]] = [
-            _clone_params(self.theta_base) for _ in range(self.m)
+        self.population: List[Dict[str, torch.Tensor]] = [
+            _clone_params(self.theta_base) for _ in range(int(self.ga.m))
         ]
-        self.pop_sent: Optional[List[Dict[str, torch.Tensor]]] = None
 
-        self.cached_deltas: List[Dict[str, torch.Tensor]] = []
-        self.sentinel_indices: List[List[Tuple[str, int]]] = []
-        self.sentinel_values: List[torch.Tensor] = []
-
-        self._refresh_sentinels()
-
-        self.model: nn.Module = model_ctor(num_classes).to(device)
-        self._local_model: Optional[nn.Module] = None
-        if self.reuse_local_model:
-            self._local_model = model_ctor(num_classes).to(device)
+        # shared scratch model for cheap validation evaluation
+        self._scratch_model: nn.Module = model_ctor(self.num_classes).to(self.device)
 
         self.round_idx = 0
+        self.last_usage_counts: List[int] = [0 for _ in range(int(self.ga.m))]
 
-        self.attribution_correct_total = 0
-        self.attribution_total_total = 0
-
-    def _init_orth_keys(self) -> None:
-        num_orth_keys = max(1, int(len(self.param_keys) * self.orth_subset_ratio))
-        if self.orth_subset_ratio < 1.0:
-            indices = self.rng.choice(len(self.param_keys), size=num_orth_keys, replace=False)
-            self.orth_keys = [self.param_keys[i] for i in sorted(indices)]
-        else:
-            self.orth_keys = self.param_keys.copy()
-
-    def _resample_orth_keys(self) -> None:
-        if self.orth_subset_ratio < 1.0:
-            num_orth_keys = max(1, int(len(self.param_keys) * self.orth_subset_ratio))
-            indices = self.rng.choice(len(self.param_keys), size=num_orth_keys, replace=False)
-            self.orth_keys = [self.param_keys[i] for i in sorted(indices)]
-
-    def _compute_nu(self, ref_params: Dict[str, torch.Tensor]) -> None:
-        if len(self.low_sens_pool) == 0:    
-            self.nu = self.nu_min
-            print(f"[FedEvo] nu_scale={self.nu_scale} -> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.1e})")
-            return
-
-        values: List[float] = []
-        for key, idx in self.low_sens_pool[: min(1000, len(self.low_sens_pool))]:
-            if key in ref_params:
-                w = ref_params[key].flatten()
-                if idx < w.numel():
-                    values.append(float(w[idx].item()))
-
-        if len(values) > 0:
-            std = float(np.std(values))
-            raw_nu = self.nu_scale * std
-        else:
-            raw_nu = self.nu_scale * 0.01
-
-        self.nu = float(np.clip(raw_nu, self.nu_min, self.nu_max))
-        print(
-            f"[FedEvo] nu_scale={self.nu_scale} std={std:.3e} raw_nu={raw_nu:.3e} "
-            f"-> nu={self.nu:.3e} (min={self.nu_min:.3e}, max={self.nu_max:.1e}) "
-            f"[pool={len(self.low_sens_pool)} sample_n={len(values)}]"
-        )
-
-
-    def _build_low_sens_index_pool(self) -> None:
-        """Build a flat pool of (param_key, flat_index) coordinates for sentinel embedding.
-
-        This pool is derived from *trainable parameters only* (self.base_params), restricted by
-        self.low_sens_keys. We require pool size >= m*d so each candidate can receive d unique
-        sentinel coordinates without reuse.
-        """
-        self.low_sens_pool: List[Tuple[str, int]] = []
-        for key in self.low_sens_keys:
-            if key not in self.base_params:
-                continue
-            numel = self.base_params[key].numel()
-            self.low_sens_pool.extend([(key, i) for i in range(numel)])
-
-        need = self.m * self.d
-        print(
-            f"[FedEvo] low_sens_mode={self.low_sens_mode} "
-            f"low_sens_keys={len(self.low_sens_keys)}, "
-            f"low_sens_pool={len(self.low_sens_pool)}, need={need}"
-        )
-
-        if len(self.low_sens_pool) < need:
-            raise ValueError(
-                f"[FedEvo] Low-sensitivity pool too small: {len(self.low_sens_pool)} < need={need}. "
-                f"Try: (1) decrease d, (2) increase model capacity (more bias/norm params), "
-                f"or (3) relax low-sens filter (e.g., bias_norm)."
-            )
-
-
-    def _refresh_sentinels(self) -> None:
-        if not self.enable_sentinels:
-            self.sentinel_indices = [[] for _ in range(self.m)]
-            self.sentinel_values = [torch.tensor([], device=self.device) for _ in range(self.m)]
-            return
-
-        shuffled = self.low_sens_pool.copy()
-        self.rng.shuffle(shuffled)
-
-        self.sentinel_indices = []
-        self.sentinel_values = []
-        for j in range(self.m):
-            start = j * self.d
-            end = (j + 1) * self.d
-            I_j = shuffled[start:end] if end <= len(shuffled) else shuffled[start:]
-            self.sentinel_indices.append(I_j)
-
-            bits = self.rng.choice([-1.0, 1.0], size=(len(I_j),)).astype(np.float32)
-            w_j = torch.from_numpy(bits).to(self.device) * float(self.nu)
-            self.sentinel_values.append(w_j)
-
-    def _embed_sentinel(self, j: int) -> None:
-        if self.pop_sent is None or not self.enable_sentinels:
-            return
-        I_j = self.sentinel_indices[j]
-        w_j = self.sentinel_values[j]
-        with torch.no_grad():
-            for idx, (key, flat_idx) in enumerate(I_j):
-                if key in self.pop_sent[j] and idx < len(w_j):
-                    w = self.pop_sent[j][key]
-                    w_flat = w.reshape(-1)
-                    if flat_idx < w_flat.numel():
-                        # Additive sentinel embedding (empirically more stable than overwrite):
-                        #   pop_sent[j][I_j] = pop_raw[j][I_j] + w_j
-                        w_flat[flat_idx] += w_j[idx].to(w_flat.dtype)
-
-    def _embed_all_sentinels(self) -> None:
-        if self.pop_sent is None or not self.enable_sentinels:
-            return
-        for j in range(self.m):
-            self._embed_sentinel(j)
-
-    def _extract_delta_slice(self, delta: Dict[str, torch.Tensor], j: int) -> torch.Tensor:
-        I_j = self.sentinel_indices[j]
-        values: List[float] = []
-        for key, flat_idx in I_j:
-            if key in delta:
-                d = delta[key].reshape(-1)
-                values.append(float(d[flat_idx].item()) if flat_idx < d.numel() else 0.0)
-            else:
-                values.append(0.0)
-        return torch.tensor(values, device=self.device, dtype=torch.float32)
-
-
-    def _lift_delta_sent_to_raw(self, delta_sent: Dict[str, torch.Tensor], j_hat: int) -> Dict[str, torch.Tensor]:
-        """Convert delta w.r.t. pop_sent[j_hat] into delta w.r.t. pop_raw[j_hat].
-
-        Paper protocol (Eq.3) defines delta_sent = local - pop_sent[j*].
-        Our evolution state is sentinel-free pop_raw. Since pop_sent[j] is pop_raw[j] with
-        additive sentinels on I_j (Eq.4-style embedding), we can recover:
-            delta_raw = local - pop_raw[j] = delta_sent + (pop_sent[j] - pop_raw[j])
-        where the offset is non-zero only on sentinel indices I_j.
-        """
-        delta_raw: Dict[str, torch.Tensor] = {k: v.detach().clone() for k, v in delta_sent.items()}
-        if (self.pop_sent is None) or (not self.enable_sentinels):
-            return delta_raw
-
-        I_j = self.sentinel_indices[j_hat]
-        with torch.no_grad():
-            for (key, flat_idx) in I_j:
-                if key not in delta_raw:
-                    continue
-                # offset = pop_sent - pop_raw at sentinel coords (additive => non-zero only here)
-                ps = self.pop_sent[j_hat][key].reshape(-1).float()
-                pr = self.pop_raw[j_hat][key].reshape(-1).float()
-                if flat_idx >= ps.numel() or flat_idx >= pr.numel():
-                    continue
-                off = (ps[flat_idx] - pr[flat_idx]).to(delta_raw[key].dtype)
-                dflat = delta_raw[key].reshape(-1)
-                if flat_idx < dflat.numel():
-                    dflat[flat_idx] += off
-        return delta_raw
-
-
-    def _scores_for_delta(self, delta: Dict[str, torch.Tensor]) -> List[float]:
-        """Compute attribution scores for all candidates (same as _attribute, but returns full list)."""
-        scores: List[float] = []
-        for j in range(self.m):
-            delta_slice = self._extract_delta_slice(delta, j)
-            w_j = self.sentinel_values[j]
-            min_len = min(delta_slice.numel(), w_j.numel())
-            if min_len == 0:
-                scores.append(float("inf"))
-            else:
-                scores.append(_l2_score(delta_slice[:min_len], w_j[:min_len]))
-        return scores
-
-
-    def _attribute(self, delta: Dict[str, torch.Tensor]) -> Tuple[int, float]:
-        if not self.enable_sentinels:
-            # Ablation: sentinel off => attribution collapses (all routed to 0)
-            return 0, float("inf")
-
-        scores: List[float] = []
-        for j in range(self.m):
-            delta_slice = self._extract_delta_slice(delta, j)
-            w_j = self.sentinel_values[j]
-            min_len = min(delta_slice.numel(), w_j.numel())
-            if min_len == 0:
-                scores.append(float("inf"))
-            else:
-                score = _l2_score(delta_slice[:min_len], w_j[:min_len])
-                scores.append(score)
-
-        best_j = int(np.argmin(scores))
-        sorted_scores = sorted(scores)
-        margin = float("inf") if len(sorted_scores) < 2 else float(sorted_scores[1] - sorted_scores[0])
-        return best_j, margin
-
-    def _should_mutate(self, H_t: float, margin_p50: float) -> bool:
-        """Return True if mutation is allowed this round.
-
-        Rationale:
-        - Paper gate: mutate when entropy is low (H_t < tau).
-        - Practical stability: additionally require attribution confidence (margin_p50 high enough)
-          and avoid the first few warmup rounds.
-        """
-        if not self.enable_mutation:
-            return False
-        if self.round_idx < self.mut_warmup_rounds:
-            return False
-        if not (H_t < self.tau):
-            return False
-        if margin_p50 < self.mut_margin_p50_min:
-            return False
-        return True
-
-    def _seed_population(self) -> None:
-        warm_deltas = self.cached_deltas.copy()
-        if len(warm_deltas) == 0:
-            self.pop_raw = [_clone_params(self.theta_base) for _ in range(self.m)]
-            return
-
-        self.rng.shuffle(warm_deltas)
-        new_pop: List[Dict[str, torch.Tensor]] = []
-        for j in range(self.m):
-            start_idx = j * self.k
-            end_idx = min((j + 1) * self.k, len(warm_deltas))
-            if start_idx >= len(warm_deltas):
-                new_pop.append(_clone_params(self.theta_base))
-            else:
-                group_deltas = warm_deltas[start_idx:end_idx]
-                avg_delta = _avg_params(group_deltas)
-                new_pop.append(_add_params(self.theta_base, avg_delta))
-        self.pop_raw = new_pop
+    # ----------------------- public API -----------------------
 
     def run_round(
         self,
@@ -518,341 +154,195 @@ class FedEvoRunner:
         sgd_cfg: Tuple[float, float, float],
         seed_train: int,
     ) -> Tuple[float, int]:
+        """
+        Returns:
+            mean_train_loss: float
+            uplink_bytes: int
+        """
         lr, momentum, weight_decay = sgd_cfg
         self.round_idx += 1
-        St = list(client_ids)
+        St = list(map(int, client_ids))
 
-        # Seeding policy
-        if self.seed_every_round or self.round_idx == 1:
-            self._seed_population()
+        # per-candidate buckets
+        deltas_by_j: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(self.ga.m)]
+        n_by_j: List[List[int]] = [[] for _ in range(self.ga.m)]
+        usage_counts = np.zeros((self.ga.m,), dtype=np.int64)
 
-        if self.recompute_nu_each_round:
-            self._compute_nu(self.theta_base)
-
-        if self.resample_orth_keys_each_round:
-            self._resample_orth_keys()
-
-        # Sentinel round init
-        self.pop_sent = [_clone_params(p) for p in self.pop_raw]
-        self._refresh_sentinels()
-        self._embed_all_sentinels()
-
-        all_deltas_sent: List[Dict[str, torch.Tensor]] = []  # deltas uploaded by clients (Eq.3)
-        all_deltas_raw: List[Dict[str, torch.Tensor]] = []   # deltas lifted to pop_raw coordinates for evolution
-        all_local_params: List[Dict[str, torch.Tensor]] = []
-        all_sample_counts: List[int] = []
-
-        S_j: List[Set[int]] = [set() for _ in range(self.m)]
         train_losses: List[float] = []
         uplink_bytes = 0
-        client_to_delta_sent: Dict[int, Dict[str, torch.Tensor]] = {}
-        client_to_delta_raw: Dict[int, Dict[str, torch.Tensor]] = {}
 
-        round_correct = 0
-        round_total = 0
-        round_margins: List[float] = []
-
+        # ---------- client loop ----------
         for cid in St:
-            cid_int = int(cid)
-            j_star = self._client_select_best(client_val_loaders[cid_int])
+            j_star = self._client_select_best(client_val_loaders[cid])
 
-            if self.reuse_local_model and self._local_model is not None:
-                local_model = self._local_model
-            else:
-                local_model = self.model_ctor(self.num_classes).to(self.device)
+            local_model = self.model_ctor(self.num_classes).to(self.device)
+            load_param_state_dict_(local_model, self.population[j_star])
 
-            load_param_state_dict_(local_model, self.pop_sent[j_star])
-
-            loss, num_samples = self._local_train(
-                local_model,
-                client_train_loaders[cid_int],
-                epochs=epochs,
-                lr=lr,
-                momentum=momentum,
-                weight_decay=weight_decay,
-                seed=seed_train + cid_int,
+            loss, n = self._local_train(
+                model=local_model,
+                loader=client_train_loaders[cid],
+                epochs=int(epochs),
+                lr=float(lr),
+                momentum=float(momentum),
+                weight_decay=float(weight_decay),
+                seed=int(seed_train) + cid,
             )
             train_losses.append(loss)
-            all_sample_counts.append(num_samples)
 
             local_params = param_state_dict(local_model)
-            all_local_params.append(local_params)
 
-            # Client upload delta per paper Eq.(3): delta_sent = local - pop_sent[j*]
-            delta_sent = {
-                k: (local_params[k].float() - self.pop_sent[j_star][k].float()).to(local_params[k].dtype)
+            # delta-only uplink (FedAvg-level)
+            delta = {
+                k: (local_params[k].float() - self.population[j_star][k].float()).to(local_params[k].dtype)
                 for k in self.param_keys
             }
+            uplink_bytes += uplink_bytes_for_delta(delta)
 
-            # Uplink cost matches FedAvg: client sends only one delta (no IDs / losses)
-            uplink_bytes += uplink_bytes_for_delta(delta_sent)
+            deltas_by_j[j_star].append(delta)
+            n_by_j[j_star].append(int(n))
+            usage_counts[j_star] += 1
 
-            # Server-side attribution per Eq.(5) using sentinel slices from delta_sent
-            j_hat, margin = self._attribute(delta_sent)
-            S_j[j_hat].add(cid_int)
+        self.last_usage_counts = usage_counts.tolist()
 
-
-            # For evolution we keep a sentinel-free state (pop_raw).
-            # Lift delta_sent (w.r.t. pop_sent[j_hat]) back to pop_raw[j_hat] coordinates.
-            delta_raw = self._lift_delta_sent_to_raw(delta_sent, j_hat)
-
-            all_deltas_sent.append(delta_sent)
-            all_deltas_raw.append(delta_raw)
-            client_to_delta_sent[cid_int] = delta_sent
-            client_to_delta_raw[cid_int] = delta_raw
-
-            round_total += 1
-            round_margins.append(margin)
-            if j_hat == j_star:
-                round_correct += 1
-
-        # Round-level margin stats (used for mutation gating + logging)
-        if round_margins:
-            margin_arr = np.array(round_margins, dtype=np.float64)
-            margin_mean = float(np.mean(margin_arr))
-            margin_p50 = float(np.percentile(margin_arr, 50))
-            margin_p90 = float(np.percentile(margin_arr, 90))
-        else:
-            margin_mean = margin_p50 = margin_p90 = 0.0
-        self.last_margin_p50 = float(margin_p50)
-
-        self.attribution_correct_total += round_correct
-        self.attribution_total_total += round_total
-
-        # θ̄_j computed on sentinel-free base pop_raw[j]
+        # ---------- candidate-wise aggregation ----------
         theta_bars: List[Dict[str, torch.Tensor]] = []
-        for j in range(self.m):
-            if len(S_j[j]) == 0:
-                theta_bars.append(_clone_params(self.pop_raw[j]))
-            else:
-                deltas_j = [client_to_delta_raw[k] for k in S_j[j]]
-                avg_delta = _avg_params(deltas_j)
-                theta_bars.append(_add_params(self.pop_raw[j], avg_delta))
+        for j in range(self.ga.m):
+            if len(deltas_by_j[j]) == 0:
+                theta_bars.append(_clone_params(self.population[j]))
+                continue
 
-        total = max(1, sum(len(s) for s in S_j))
-        p_j = np.array([len(S_j[j]) / total for j in range(self.m)], dtype=np.float64)
-        H_t = float(-np.sum(p_j[p_j > 0] * np.log(p_j[p_j > 0] + 1e-12)))
-        usage_counts = np.array([len(s) for s in S_j], dtype=np.int64)
-
-        # Stabilizer: average of local final params (optionally sample-weighted)
-        if len(all_deltas_raw) > 0:
-            # Paper Eq.(7): stabilizer is base plus mean client delta (delta-only uplink)
             if self.weight_by_samples:
-                delta_bar = _avg_params(all_deltas_raw, weights=[float(n) for n in all_sample_counts])
+                weights = [float(n) for n in n_by_j[j]]
+                avg_delta = _avg_state_dicts(deltas_by_j[j], self.param_keys, weights=weights)
             else:
-                delta_bar = _avg_params(all_deltas_raw)
-            theta_stab = _add_params(self.theta_base, delta_bar, scale=1.0)
-        else:
-            theta_stab = _clone_params(self.theta_base)
+                avg_delta = _avg_state_dicts(deltas_by_j[j], self.param_keys, weights=None)
 
-        used_bars = [theta_bars[j] for j in range(self.m) if len(S_j[j]) > 0]
-        theta_used = _avg_params(used_bars) if len(used_bars) > 0 else _clone_params(theta_stab)
+            theta_bars.append(_add_sd(self.population[j], avg_delta, self.param_keys))
 
-        self._evolve(
-            theta_bars,
-            theta_stab,
-            theta_used,
-            p_j,
-            H_t,
-            usage_counts,
-            all_deltas_raw,
-            margin_p50=float(margin_p50),
-        )
+        # ---------- GA evolution ----------
+        self.population = self._evolve(theta_bars, usage_counts)
 
-        # Persist only sentinel-free base
-        self.theta_base = _clone_params(theta_stab)
+        # "base" anchor for eval: most-used theta_bar (ties resolved by smallest index)
+        best_j = int(np.argmax(usage_counts)) if usage_counts.sum() > 0 else 0
+        self.theta_base = _clone_params(theta_bars[best_j])
 
-        # Cache deltas for population seeding
-        self.cached_deltas = all_deltas_raw.copy()
-        max_cache = self.m * self.k
-        if len(self.cached_deltas) > max_cache:
-            self.cached_deltas = self.cached_deltas[-max_cache:]
+        mean_loss = float(np.mean(train_losses)) if train_losses else 0.0
+        return mean_loss, int(uplink_bytes)
 
-        self.pop_sent = None
+    def get_best_model(self) -> nn.Module:
+        load_param_state_dict_(self._scratch_model, self.theta_base)
+        return self._scratch_model
 
-        # Logging
-        attr_acc_round = round_correct / max(1, round_total)
-        attr_acc_cum = self.attribution_correct_total / max(1, self.attribution_total_total)
+    # ----------------------- internal: GA ops -----------------------
 
-        mut_allowed = self._should_mutate(H_t=H_t, margin_p50=float(margin_p50))
+    def _evolve(self, theta_bars: List[Dict[str, torch.Tensor]], usage_counts: np.ndarray) -> List[Dict[str, torch.Tensor]]:
+        m = int(self.ga.m)
+        if m != len(theta_bars):
+            raise ValueError(f"Population size mismatch: ga.m={m} but got {len(theta_bars)} theta_bars")
 
-        print(
-            f"[FedEvo R{self.round_idx}] H={H_t:.3f} τ={self.tau:.3f} "
-            f"|S_j|={[len(s) for s in S_j]} "
-            f"mut={'Y' if mut_allowed else 'N'} "
-            f"attr_r={attr_acc_round:.3f} attr_c={attr_acc_cum:.3f} "
-            f"margin(mean/p50/p90)={margin_mean:.4f}/{margin_p50:.4f}/{margin_p90:.4f}"
-        )
+        # Prepare ordering
+        order_desc = np.argsort(-usage_counts)  # most used first
+        new_pop: List[Dict[str, torch.Tensor]] = []
 
-        return float(np.mean(train_losses)) if train_losses else 0.0, int(uplink_bytes)
+        # 1) Elitism: keep top elites unchanged
+        elite_n = max(0, min(int(self.ga.elitism), m))
+        for i in range(elite_n):
+            j = int(order_desc[i])
+            new_pop.append(_clone_params(theta_bars[j]))
 
-    def _evolve(
-        self,
-        theta_bars: List[Dict[str, torch.Tensor]],
-        theta_stab: Dict[str, torch.Tensor],
-        theta_used: Dict[str, torch.Tensor],
-        p_j: np.ndarray,
-        H_t: float,
-        usage_counts: np.ndarray,
-        all_deltas_raw: List[Dict[str, torch.Tensor]],
-        margin_p50: float,
-    ) -> None:
-        order_asc = np.argsort(usage_counts)
+        remaining = m - len(new_pop)
 
-        new_slots: List[CandidateSlot] = []
-        capacity = self.m
-
-        # Soft elitism: protect bottom-ζ usage candidates
-        for i in range(min(self.zeta, len(order_asc))):
-            j_rare = int(order_asc[i])
-            new_slots.append(
-                CandidateSlot(_clone_params(theta_bars[j_rare]), source_id=j_rare, is_protected=True)
-            )
-
-        remaining = capacity - len(new_slots)
-
-        # Inject stabilizer & used-average candidates
+        # 2) Top-k weighted aggregate (exploitation)
         if remaining > 0:
-            new_slots.append(CandidateSlot(_clone_params(theta_stab), source_id=None, is_protected=False))
-            remaining -= 1
+            k_star = max(1, int(math.floor(float(self.ga.rho) * m)))
+            top = order_desc[:k_star]
 
-        if remaining > 0:
-            new_slots.append(CandidateSlot(_clone_params(theta_used), source_id=None, is_protected=False))
-            remaining -= 1
-
-        # Top-k weighted average
-        if remaining > 0:
-            k_star = max(1, int(self.rho * self.m))
-            top_k_indices = np.argsort(-usage_counts)[:k_star]
-            weights = np.power(usage_counts[top_k_indices].astype(np.float64) + 1e-8, self.gamma)
-            weights = weights / (weights.sum() + 1e-12)
+            w = (usage_counts[top].astype(np.float64) + 1e-8) ** float(self.ga.gamma)
+            w = w / (w.sum() + _EPS)
 
             theta_topk: Dict[str, torch.Tensor] = {}
             for key in self.param_keys:
-                weighted_sum = torch.zeros_like(theta_bars[0][key], dtype=torch.float32)
-                for wi, j in enumerate(top_k_indices):
-                    weighted_sum += float(weights[wi]) * theta_bars[int(j)][key].float()
-                theta_topk[key] = weighted_sum.to(theta_bars[0][key].dtype)
+                acc = torch.zeros_like(theta_bars[0][key], dtype=torch.float32)
+                for wi, j in zip(w, top):
+                    acc += float(wi) * theta_bars[int(j)][key].float()
+                theta_topk[key] = acc.to(theta_bars[0][key].dtype)
 
-            new_slots.append(CandidateSlot(theta_topk, source_id=None, is_protected=False))
+            new_pop.append(theta_topk)
             remaining -= 1
 
-        # Stochastic interpolation (parents restricted to top-by-usage set)
-        num_interp = max(1, remaining // 2)
-        parent_pool = np.argsort(-usage_counts)[: max(2, int(self.rho * self.m))]
-
-        for _ in range(num_interp):
-            if remaining <= 0:
-                break
-
-            probs = p_j[parent_pool]
-            if probs.sum() > 0:
-                probs = probs / (probs.sum() + 1e-12)
-            else:
-                probs = np.ones(len(parent_pool), dtype=np.float64) / len(parent_pool)
-
-            p_idx = int(self.rng.choice(parent_pool, p=probs))
-            q_idx = int(self.rng.choice(parent_pool, p=probs))
-            lam = float(self.rng.uniform(0.4, 0.6))
-
-            child: Dict[str, torch.Tensor] = {}
-            for key in self.param_keys:
-                wp = theta_bars[p_idx][key].float()
-                wq = theta_bars[q_idx][key].float()
-                child[key] = (lam * wp + (1.0 - lam) * wq).to(theta_bars[p_idx][key].dtype)
-
-            new_slots.append(CandidateSlot(child, source_id=None, is_protected=False))
-            remaining -= 1
-
-        # Orthogonal injection (optional)
-        if remaining > 0 and self.enable_orth_injection:
-            stab_vec = _vec(theta_stab, self.orth_keys)
-            min_cos, j_orth = float("inf"), 0
-
-            for j in range(self.m):
-                bar_vec = _vec(theta_bars[j], self.orth_keys)
-                cos = _cosine_similarity(bar_vec, stab_vec)
-                if cos < min_cos:
-                    min_cos, j_orth = cos, j
-
-            if len(all_deltas_raw) > 0:
-                delta_bar = _avg_params(all_deltas_raw)
-                theta_orth = _add_params(theta_bars[j_orth], delta_bar, scale=1.0)
-            else:
-                theta_orth = _clone_params(theta_bars[j_orth])
-
-            new_slots.append(CandidateSlot(theta_orth, source_id=j_orth, is_protected=False))
-            remaining -= 1
-
-        # Fill remaining with random interpolations
+        # 3) Crossover fill
         while remaining > 0:
-            p_idx = int(self.rng.randint(0, self.m))
-            q_idx = int(self.rng.randint(0, self.m))
-            lam = float(self.rng.uniform(0.4, 0.6))
+            p_idx, q_idx = self._sample_two_parents(usage_counts)
+            lam = float(self.rng.uniform(float(self.ga.lam_low), float(self.ga.lam_high)))
 
-            child: Dict[str, torch.Tensor] = {}
-            for key in self.param_keys:
-                wp = theta_bars[p_idx][key].float()
-                wq = theta_bars[q_idx][key].float()
-                child[key] = (lam * wp + (1.0 - lam) * wq).to(theta_bars[p_idx][key].dtype)
-
-            new_slots.append(CandidateSlot(child, source_id=None, is_protected=False))
+            child = {
+                k: (lam * theta_bars[p_idx][k].float() + (1.0 - lam) * theta_bars[q_idx][k].float()).to(theta_bars[p_idx][k].dtype)
+                for k in self.param_keys
+            }
+            new_pop.append(child)
             remaining -= 1
 
-        new_slots = new_slots[:capacity]
+        # 4) Mutation (optional): mutate non-elite slots only (index >= elite_n)
+        if self.ga.enable_mutation and float(self.ga.mutate_prob_layer) > 0.0:
+            for i in range(elite_n, len(new_pop)):
+                self._mutate_inplace(new_pop[i])
 
-        # Mutation on low-usage sourced slots only, additionally gated by attribution confidence.
-        if self._should_mutate(H_t=float(H_t), margin_p50=float(margin_p50)):
-            self._apply_mutation(new_slots, usage_counts)
+        return new_pop[:m]
 
-        self.pop_raw = [slot.params for slot in new_slots]
+    def _sample_two_parents(self, usage_counts: np.ndarray) -> Tuple[int, int]:
+        m = int(self.ga.m)
+        # If no usage signal, sample uniformly
+        if usage_counts.sum() <= 0:
+            p, q = self.rng.choice(m, size=2, replace=False).tolist()
+            return int(p), int(q)
 
-    def _apply_mutation(self, slots: List[CandidateSlot], usage_counts: np.ndarray) -> None:
-        all_keys = self.param_keys.copy()
-        num_layers_to_mutate = max(1, len(all_keys) // 3)
+        probs = usage_counts.astype(np.float64) + 1e-8
+        probs = probs / (probs.sum() + _EPS)
+        p = int(self.rng.choice(m, p=probs))
+        q = int(self.rng.choice(m, p=probs))
+        # ensure distinct parents (retry a few times then force)
+        for _ in range(5):
+            if q != p:
+                break
+            q = int(self.rng.choice(m, p=probs))
+        if q == p:
+            q = int((p + 1) % m)
+        return p, q
 
-        m = int(len(usage_counts))
-        num_low = max(1, int(math.ceil(m * 0.5)))
-        low_freq_ids = set(np.argsort(usage_counts)[:num_low].tolist())
-
-        for slot in slots:
-            if slot.is_protected:
+    def _mutate_inplace(self, sd: Dict[str, torch.Tensor]) -> None:
+        # Coarse mutation: with probability mutate_prob_layer per tensor (layer),
+        # add Gaussian noise scaled by sigma_mut * std(layer).
+        for k in self.param_keys:
+            if float(self.rng.rand()) >= float(self.ga.mutate_prob_layer):
                 continue
-            if slot.source_id is None:
-                continue
-            if slot.source_id not in low_freq_ids:
-                continue
+            w = sd[k]
+            std = float(w.float().std().item())
+            if not np.isfinite(std) or std <= 0.0:
+                std = 1e-4
+            sigma = float(self.ga.sigma_mut) * std
+            noise = torch.randn_like(w.float()) * sigma
+            sd[k] = (w.float() + noise).to(w.dtype)
 
-            layers_to_mutate = self.rng.choice(
-                all_keys,
-                size=min(num_layers_to_mutate, len(all_keys)),
-                replace=False,
-            )
-            for key in layers_to_mutate:
-                w = slot.params[key]
-                std = float(w.float().std().item())
-                sigma = float(self.sigma_mut * std) if std > 0 else 1e-4
-                noise = torch.randn_like(w.float()) * sigma
-                slot.params[key] = (w.float() + noise).to(w.dtype)
+    # ----------------------- internal: client work -----------------------
 
     @torch.inference_mode()
     def _client_select_best(self, val_loader) -> int:
         best_j, best_loss = 0, float("inf")
-        for j in range(self.m):
-            load_param_state_dict_(self.model, self.pop_sent[j])
-            loss = self._eval_loss_limited(self.model, val_loader)
+        for j in range(int(self.ga.m)):
+            load_param_state_dict_(self._scratch_model, self.population[j])
+            loss = self._eval_loss_limited(self._scratch_model, val_loader)
             if loss < best_loss:
                 best_loss = loss
                 best_j = j
-        return best_j
+        return int(best_j)
 
     @torch.inference_mode()
     def _eval_loss_limited(self, model: nn.Module, loader) -> float:
         model.eval()
         total_loss, total_samples = 0.0, 0
-        batch_count = 0
+        batches = 0
         for x, y in loader:
-            if self.val_batches is not None and batch_count >= self.val_batches:
+            if self.val_batches is not None and batches >= int(self.val_batches):
                 break
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
@@ -860,7 +350,7 @@ class FedEvoRunner:
             loss = F.cross_entropy(logits, y, reduction="sum")
             total_loss += float(loss.item())
             total_samples += int(y.numel())
-            batch_count += 1
+            batches += 1
         return total_loss / max(1, total_samples)
 
     def _local_train(
@@ -873,47 +363,38 @@ class FedEvoRunner:
         weight_decay: float,
         seed: int,
     ) -> Tuple[float, int]:
-        torch.manual_seed(seed)
+        torch.manual_seed(int(seed))
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+            torch.cuda.manual_seed_all(int(seed))
 
         model.train()
-        optimizer = torch.optim.SGD(
+        opt = torch.optim.SGD(
             model.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
+            lr=float(lr),
+            momentum=float(momentum),
+            weight_decay=float(weight_decay),
         )
 
         total_loss, total_samples = 0.0, 0
-        for _ in range(epochs):
+        for _ in range(int(epochs)):
             for x, y in loader:
                 x = x.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
 
-                optimizer.zero_grad(set_to_none=True)
+                opt.zero_grad(set_to_none=True)
                 logits = model(x)
                 loss = F.cross_entropy(logits, y)
                 loss.backward()
-                optimizer.step()
+                opt.step()
 
                 bs = int(y.numel())
                 total_loss += float(loss.item()) * bs
                 total_samples += bs
+
         if total_samples == 0:
-            # epochs=0 스모크 테스트 등에서 가중치가 0이 되어 평균이 터지는 걸 방지
             try:
                 total_samples = int(len(loader.dataset))
             except Exception:
-                total_samples = 1  # 최후의 안전장치
+                total_samples = 1
 
         return total_loss / max(1, total_samples), total_samples
-    
-
-    def get_best_model(self) -> nn.Module:
-        load_param_state_dict_(self.model, self.theta_base)
-        return self.model
-
-    def get_attribution_accuracy(self) -> float:
-        return self.attribution_correct_total / max(1, self.attribution_total_total)
-    

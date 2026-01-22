@@ -1,90 +1,77 @@
 """
-models.py
+main_iid_ga.py
 
-Model definitions used in the FedEvo experiments.
-- ResNet18_CIFAR: ResNet-18 variant adapted for CIFAR-10/100
-- build_split_resnet18_cifar: helper to construct split models for FedImpro
+Entry point for IID experiments focusing on Genetic Candidate Evolution (FedEvo-FL).
+- Removes non-IID Dirichlet partition.
+- Adds --algo {fedavg, fedevo}. (fedavg is FedEvo with m=1 and mutation off)
+- Keeps evaluation pipeline consistent with existing codebase.
 
-Design note:
-Models are intentionally kept minimal and deterministic-friendly
-to isolate the effect of the learning algorithm (FedEvo) rather than architecture choices.
+This file is designed to live alongside your existing main.py without breaking it.
 """
-"""
-main.py
-
-Entry point for federated learning experiments, including FedMut, FedImpro, and FedEvo.
-
-This script reproduces all experimental results reported in the paper.
-
-CLI design:
-- --algo, --dataset: select algorithm and dataset
-- --alpha: Dirichlet concentration parameter controlling Non-IID severity
-- --rounds: number of federated communication rounds
-
-FedEvo-specific knobs (Section X in the paper):
-- --d: sentinel dimension per candidate (must satisfy low-sensitivity pool size)
-- --nu_scale: sentinel magnitude scaling, controlling attribution separability
-- --local_steps: number of local SGD steps; excessive values may weaken sentinel signals
-
-Recommended quick smoke test:
-python main.py --algo fedevo --dataset cifar10 --rounds 2 --d 512 --nu_scale 0.02 --local_steps 1
-"""
-
 
 import os
 from datetime import datetime
 
 import argparse
 import csv
-import copy
-from typing import Dict, List, Sequence
+from typing import Dict, List
 
 import numpy as np
 import torch
 
 from algorithms.base import evaluate, make_loader, set_global_seed
-from algorithms.fedimpro import FedImproRunner
-from algorithms.fedmut import FedMutRunner
-from algorithms.fedevo import FedEvoRunner
-from data_utils import client_train_val_split, dirichlet_partition, load_cifar, make_subset
-from models import ResNet18_CIFAR, build_split_resnet18_cifar
+from algorithms.fedevo import FedEvoRunner, GAConfig
+from data_utils import client_train_val_split, load_cifar, make_subset
+from models import ResNet18_CIFAR
+
 
 def build_out_csv_path(out_dir: str, algo: str, dataset: str) -> str:
-    """
-    결과 CSV 파일명을 자동 생성한다.
-    예: ./results/fedevo_cifar10_20260112-104233.csv
-    """
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = f"{algo}_{dataset}_{ts}.csv"
-    return os.path.join(out_dir, filename)
+    return os.path.join(out_dir, f"{algo}_{dataset}_IID_{ts}.csv")
 
 
-def build_client_schedule(num_clients: int, clients_per_round: int, rounds: int, seed_sample: int) -> List[List[int]]:
-    rng = np.random.RandomState(seed_sample)
-    schedule: List[List[int]] = []
-    for _ in range(rounds):
-        ids = rng.choice(num_clients, size=clients_per_round, replace=False).tolist()
-        schedule.append(ids)
-    return schedule
+def iid_partition(num_samples: int, num_clients: int, seed: int) -> Dict[int, List[int]]:
+    """
+    IID partition: randomly shuffle all indices, split as evenly as possible across clients.
+    Returns dict {client_id: [sample_indices]}
+    """
+    rng = np.random.RandomState(seed)
+    idx = np.arange(num_samples, dtype=np.int64)
+    rng.shuffle(idx)
+
+    splits: Dict[int, List[int]] = {c: [] for c in range(num_clients)}
+    # near-equal split
+    per = num_samples // num_clients
+    rem = num_samples % num_clients
+    start = 0
+    for c in range(num_clients):
+        size = per + (1 if c < rem else 0)
+        splits[c] = idx[start:start + size].tolist()
+        start += size
+    return splits
+
+
+def build_client_schedule(num_clients: int, clients_per_round: int, rounds: int, seed: int) -> List[List[int]]:
+    rng = np.random.RandomState(seed)
+    return [rng.choice(num_clients, size=clients_per_round, replace=False).tolist() for _ in range(rounds)]
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--algo", type=str, required=True, choices=["fedmut", "fedimpro", "fedevo"])
+    p.add_argument("--algo", type=str, required=True, choices=["fedavg", "fedevo"])
     p.add_argument("--dataset", type=str, required=True, choices=["cifar10", "cifar100"])
-    p.add_argument("--alpha", type=float, default=0.1, choices=[0.1, 0.5])
-    p.add_argument("--rounds", type=int, default=1000)
-    p.add_argument("--out_dir", type=str, default="./results", help="Directory to save results CSV")
-    p.add_argument("--out_csv", type=str, default="", help="(Optional) Override output CSV path")
-
-    # ---- FedEvo auto-tune knobs (only used when --algo=fedevo) ----
-    p.add_argument("--d", type=int, default=1536, help="FedEvo sentinel dimension per candidate")
-    p.add_argument("--nu_scale", type=float, default=0.01, help="FedEvo nu scale")
-    p.add_argument("--local_steps", type=int, default=5, help="Local training steps/epochs (replaces E when fedEvo tuning)")
-    p.add_argument("--low_sens_mode", type=str, default="bias_norm", choices=["bias_only", "bias_norm"])
+    p.add_argument("--rounds", type=int, default=200)
+    p.add_argument("--out_dir", type=str, default="./results")
+    p.add_argument("--out_csv", type=str, default="")
     p.add_argument("--seed_train", type=int, default=44)
-    # --------------------------------------------------------------
+
+    # FedEvo knobs
+    p.add_argument("--m", type=int, default=5, help="Population size (candidates).")
+    p.add_argument("--enable_mutation", action="store_true", help="Enable mutation (FedEvo only).")
+    p.add_argument("--rho", type=float, default=0.4, help="Top-k ratio for exploitation.")
+    p.add_argument("--gamma", type=float, default=1.5, help="Selection weight exponent.")
+    p.add_argument("--sigma_mut", type=float, default=0.01, help="Mutation scale (fraction of layer std).")
 
     p.add_argument("--data_dir", type=str, default="./data")
     args = p.parse_args()
@@ -94,9 +81,7 @@ def main() -> None:
     else:
         out_csv_path = build_out_csv_path(args.out_dir, args.algo, args.dataset)
 
-    os.makedirs("logs", exist_ok=True)
-
-    # Locked setup
+    # Locked experimental setup (match your existing main.py style)
     N = 100
     K = 10
     E = 5
@@ -104,7 +89,7 @@ def main() -> None:
     lr = 0.01
     momentum = 0.9
     weight_decay = 1e-4
-    gamma = 0.998
+    gamma_lr = 0.998
 
     seed_data = 42
     seed_sample = 43
@@ -115,13 +100,15 @@ def main() -> None:
 
     bundle = load_cifar(args.dataset, data_dir=args.data_dir)
 
-    targets = bundle.train_dataset.targets  # list[int] for CIFAR datasets
-    client_indices = dirichlet_partition(targets, num_clients=N, alpha=float(args.alpha), seed_data=seed_data)
+    # --- IID partition here ---
+    num_train = len(bundle.train_dataset)
+    client_indices = iid_partition(num_samples=num_train, num_clients=N, seed=seed_data)
+
+    # keep same local train/val split helper
     train_idx, val_idx = client_train_val_split(client_indices, val_ratio=0.1, seed_data=seed_data)
 
-    schedule = build_client_schedule(N, K, args.rounds, seed_sample=seed_sample)
+    schedule = build_client_schedule(N, K, args.rounds, seed=seed_sample)
 
-    # Build per-client loaders (train + val).
     client_train_loaders: Dict[int, torch.utils.data.DataLoader] = {}
     client_val_loaders: Dict[int, torch.utils.data.DataLoader] = {}
     for cid in range(N):
@@ -133,81 +120,50 @@ def main() -> None:
 
     test_loader = make_loader(bundle.test_dataset, batch_size=200, shuffle=False, seed_train=seed_train, device=device)
 
-    # Build algorithm runner
-    if args.algo == "fedmut":
-        model = ResNet18_CIFAR(num_classes=bundle.num_classes)
-        runner = FedMutRunner(model=model, device=device, alpha_mut=4.0, seed_mut=9991)
-        server_model_for_eval = runner.model
-    elif args.algo == "fedimpro":
-        base = ResNet18_CIFAR(num_classes=bundle.num_classes)
-        split = build_split_resnet18_cifar(base)
-        runner = FedImproRunner(split_model=split, num_classes=bundle.num_classes, device=device)
-        server_model_for_eval = runner.model  # wrapper has forward
+    # Build runner
+    if args.algo == "fedavg":
+        ga_cfg = GAConfig(m=1, enable_mutation=False)
     else:
-        runner = FedEvoRunner(
+        ga_cfg = GAConfig(
+            m=int(args.m),
+            rho=float(args.rho),
+            gamma=float(args.gamma),
+            sigma_mut=float(args.sigma_mut),
+            enable_mutation=bool(args.enable_mutation),
+        )
+
+    runner = FedEvoRunner(
         model_ctor=ResNet18_CIFAR,
         num_classes=bundle.num_classes,
         device=device,
-        d=args.d,
-        m=5,
-        seed_evo=2025,
-        nu_scale=args.nu_scale,
-        nu_min=1e-6,
-        nu_max=1e-1,
-        feedback_log_path="logs/implicit_feedback.csv",
-        low_sens_mode=args.low_sens_mode,   # ← (fedevo.py가 이 인자 받으면 사용)
+        ga=ga_cfg,
+        seed=2025,
+        val_batches=None,
+        weight_by_samples=True,
+        deterministic=False,
     )
 
-        server_model_for_eval = runner.model
-
-
-    # Server-side LR scheduler stepped per round.
-    # For FedMut/FedImpro we can attach scheduler to a dummy optimizer on server model params.
-    # We'll implement: apply scheduler scale to client lr by updating lr each round.
     lr_current = lr
 
+    os.makedirs(os.path.dirname(out_csv_path) or ".", exist_ok=True)
     with open(out_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["round", "test_accuracy", "train_loss", "uplink_bytes"])
+        writer = csv.DictWriter(f, fieldnames=["round", "test_accuracy", "train_loss", "uplink_bytes", "usage_counts"])
         writer.writeheader()
 
         for r in range(args.rounds):
             client_ids = schedule[r]
 
-            # Run one round
-            if args.algo == "fedmut":
-                train_loss, uplink = runner.run_round(
-                    client_ids=client_ids,
-                    client_train_loaders=client_train_loaders,
-                    epochs=E,
-                    sgd_cfg=(lr_current, momentum, weight_decay),
-                    seed_train=seed_train,
-                )
-            elif args.algo == "fedimpro":
-                train_loss, uplink = runner.run_round(
-                    client_ids=client_ids,
-                    client_train_loaders=client_train_loaders,
-                    epochs=E,
-                    batch_size=batch_size,
-                    sgd_cfg=(lr_current, momentum, weight_decay),
-                    seed_train=seed_train,
-                )
-            else:
-                train_loss, uplink = runner.run_round(
-                    client_ids=client_ids,
-                    client_train_loaders=client_train_loaders,
-                    client_val_loaders=client_val_loaders,
-                    epochs=args.local_steps,
-                    sgd_cfg=(lr_current, momentum, weight_decay),
-                    seed_train=seed_train,
-                )
+            train_loss, uplink = runner.run_round(
+                client_ids=client_ids,
+                client_train_loaders=client_train_loaders,
+                client_val_loaders=client_val_loaders,
+                epochs=E,
+                sgd_cfg=(lr_current, momentum, weight_decay),
+                seed_train=seed_train,
+            )
 
-            # Evaluate global model
-            if args.algo == "fedevo":
-                model_for_eval = runner.get_best_model()  # loads runner.theta_base into runner.model
-                _, acc = evaluate(model_for_eval, test_loader, device=device)
-            else:
-                _, acc = evaluate(server_model_for_eval, test_loader, device=device)
-
+            model_for_eval = runner.get_best_model()
+            _, acc = evaluate(model_for_eval, test_loader, device=device)
 
             writer.writerow(
                 {
@@ -215,12 +171,12 @@ def main() -> None:
                     "test_accuracy": acc,
                     "train_loss": train_loss,
                     "uplink_bytes": uplink,
+                    "usage_counts": str(runner.last_usage_counts),
                 }
             )
             f.flush()
 
-            # Step scheduler once per round (ExponentialLR with gamma=0.998)
-            lr_current = lr_current * gamma
+            lr_current *= gamma_lr
 
 
 if __name__ == "__main__":
