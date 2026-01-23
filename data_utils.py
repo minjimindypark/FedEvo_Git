@@ -1,14 +1,3 @@
-"""
-data_utils.py
-
-Dataset loading and client partitioning utilities for federated learning experiments.
-Includes:
-- CIFAR-10/100 loading and normalization
-- Dirichlet-based Non-IID client partitioning
-- Per-client train/validation splits used for model selection in FedEvo
-"""
-
-
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -20,14 +9,12 @@ from torchvision import datasets, transforms
 @dataclass(frozen=True)
 class CIFARDataBundle:
     train_dataset: Dataset
+    train_plain_dataset: Dataset
     test_dataset: Dataset
     num_classes: int
 
 
 def load_cifar(dataset: str, data_dir: str = "./data") -> CIFARDataBundle:
-    """
-    Loads CIFAR-10/100 with standard normalization and standard splits.
-    """
     dataset = dataset.lower()
     if dataset not in {"cifar10", "cifar100"}:
         raise ValueError("dataset must be one of: cifar10, cifar100")
@@ -51,7 +38,7 @@ def load_cifar(dataset: str, data_dir: str = "./data") -> CIFARDataBundle:
             transforms.Normalize(mean, std),
         ]
     )
-    test_tf = transforms.Compose(
+    plain_tf = transforms.Compose(
         [
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
@@ -59,9 +46,15 @@ def load_cifar(dataset: str, data_dir: str = "./data") -> CIFARDataBundle:
     )
 
     train_dataset = ds_cls(root=data_dir, train=True, download=True, transform=train_tf)
-    test_dataset = ds_cls(root=data_dir, train=False, download=True, transform=test_tf)
+    train_plain_dataset = ds_cls(root=data_dir, train=True, download=False, transform=plain_tf)
+    test_dataset = ds_cls(root=data_dir, train=False, download=True, transform=plain_tf)
 
-    return CIFARDataBundle(train_dataset=train_dataset, test_dataset=test_dataset, num_classes=num_classes)
+    return CIFARDataBundle(
+        train_dataset=train_dataset,
+        train_plain_dataset=train_plain_dataset,
+        test_dataset=test_dataset,
+        num_classes=num_classes,
+    )
 
 
 def dirichlet_partition(
@@ -70,37 +63,30 @@ def dirichlet_partition(
     alpha: float,
     seed_data: int,
 ) -> Dict[int, List[int]]:
-    """
-    Deterministic Dirichlet label-skew partition.
-
-    - 전역 np.random.seed()를 건드리지 않음
-    - seed_data로 만든 로컬 RNG(rng)만 사용
-    """
     if alpha <= 0:
         raise ValueError("alpha must be > 0")
 
-    rng = np.random.default_rng(seed_data)  # ✅ 로컬 RNG
+    rng = np.random.default_rng(int(seed_data))
 
     targets = np.asarray(targets, dtype=np.int64)
     num_classes = int(targets.max() + 1)
 
     class_indices = [np.where(targets == c)[0] for c in range(num_classes)]
     for c in range(num_classes):
-        rng.shuffle(class_indices[c])  # ✅ 전역 shuffle -> rng.shuffle
+        rng.shuffle(class_indices[c])
 
-    # We retry until no empty clients.
-    for _attempt in range(1000):
-        client_indices: List[List[int]] = [[] for _ in range(num_clients)]
+    for _ in range(1000):
+        client_indices: List[List[int]] = [[] for _ in range(int(num_clients))]
 
         for c in range(num_classes):
             idx_c = class_indices[c]
             if len(idx_c) == 0:
                 continue
 
-            proportions = rng.dirichlet(alpha=np.full(num_clients, alpha))  # ✅ 전역 -> rng
+            proportions = rng.dirichlet(alpha=np.full(int(num_clients), float(alpha)))
             counts = (proportions * len(idx_c)).astype(int)
 
-            diff = len(idx_c) - counts.sum()
+            diff = len(idx_c) - int(counts.sum())
             if diff > 0:
                 for k in np.argsort(-proportions)[:diff]:
                     counts[k] += 1
@@ -109,24 +95,48 @@ def dirichlet_partition(
                     if counts[k] > 0:
                         counts[k] -= 1
 
-            assert counts.sum() == len(idx_c)
+            if int(counts.sum()) != int(len(idx_c)):
+                raise RuntimeError("Dirichlet partition internal error: counts mismatch")
 
             start = 0
-            for client_id in range(num_clients):
+            for client_id in range(int(num_clients)):
                 cnt = int(counts[client_id])
                 if cnt > 0:
                     client_indices[client_id].extend(idx_c[start : start + cnt].tolist())
                 start += cnt
 
-        for cid in range(num_clients):
-            rng.shuffle(client_indices[cid])  # ✅ 전역 shuffle -> rng.shuffle
+        for cid in range(int(num_clients)):
+            rng.shuffle(client_indices[cid])
 
         if all(len(v) > 0 for v in client_indices):
-            return {cid: client_indices[cid] for cid in range(num_clients)}
+            return {cid: client_indices[cid] for cid in range(int(num_clients))}
 
-    raise RuntimeError(
-        "Failed to generate a Dirichlet partition with no empty clients after many attempts."
-    )
+    raise RuntimeError("Failed to generate a Dirichlet partition with no empty clients after many attempts.")
+
+
+def iid_partition(
+    targets: List[int],
+    num_clients: int,
+    seed_data: int,
+) -> Dict[int, List[int]]:
+    rng = np.random.default_rng(int(seed_data))
+
+    num_samples = len(targets)
+    indices = np.arange(num_samples)
+    rng.shuffle(indices)
+
+    chunk_size = num_samples // int(num_clients)
+    client_indices: Dict[int, List[int]] = {}
+
+    for cid in range(int(num_clients)):
+        start = cid * chunk_size
+        end = num_samples if cid == int(num_clients) - 1 else start + chunk_size
+        client_indices[cid] = indices[start:end].tolist()
+
+    if any(len(v) == 0 for v in client_indices.values()):
+        raise RuntimeError("IID partition resulted in empty clients")
+
+    return client_indices
 
 
 def client_train_val_split(
@@ -134,11 +144,7 @@ def client_train_val_split(
     val_ratio: float,
     seed_data: int,
 ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
-    """
-    Split each client's indices into train/val deterministically,
-    without touching global RNG state.
-    """
-    if not (0.0 < val_ratio < 1.0):
+    if not (0.0 < float(val_ratio) < 1.0):
         raise ValueError("val_ratio must be in (0,1)")
 
     train_split: Dict[int, List[int]] = {}
@@ -146,24 +152,21 @@ def client_train_val_split(
 
     for cid, idxs in client_indices.items():
         idxs = list(idxs)
-
-        rng = np.random.default_rng(seed_data + 1000 + cid)  # ✅ 클라이언트별 로컬 RNG
+        rng = np.random.default_rng(int(seed_data) + 1000 + int(cid))
         rng.shuffle(idxs)
 
-        n_val = max(1, int(round(len(idxs) * val_ratio)))
-        val_split[cid] = idxs[:n_val]
-        train_split[cid] = idxs[n_val:]
+        n_val = max(1, int(round(len(idxs) * float(val_ratio))))
+        val_split[int(cid)] = idxs[:n_val]
+        train_split[int(cid)] = idxs[n_val:]
 
-        # 안전장치: train/val 비는 것 방지(원래 의도 유지)
-        if len(train_split[cid]) == 0:
-            train_split[cid] = val_split[cid][:1]
-            val_split[cid] = val_split[cid][1:]
-            if len(val_split[cid]) == 0:
-                val_split[cid] = train_split[cid][:1]
-                train_split[cid] = train_split[cid][1:]
+        if len(train_split[int(cid)]) == 0:
+            train_split[int(cid)] = val_split[int(cid)][:1]
+            val_split[int(cid)] = val_split[int(cid)][1:]
+            if len(val_split[int(cid)]) == 0:
+                val_split[int(cid)] = train_split[int(cid)][:1]
+                train_split[int(cid)] = train_split[int(cid)][1:]
 
     return train_split, val_split
-
 
 
 def make_subset(dataset: Dataset, indices: List[int]) -> Subset:
