@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import copy
-import math
 import os
 import random
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -13,77 +12,129 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
-def set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    torch.cuda.manual_seed_all(int(seed))
 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Hard determinism (may error if nondeterministic ops are used).
-    torch.use_deterministic_algorithms(True)
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+
+def _is_float_tensor(t: torch.Tensor) -> bool:
+    return isinstance(t, torch.Tensor) and t.is_floating_point()
 
 
 def param_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     """
-    Parameters only (no buffers). This is the core state we transmit + aggregate.
+    Floating-point state = parameters + floating buffers.
+    Includes BatchNorm running_mean/var; excludes integer buffers (e.g., num_batches_tracked).
     """
-    return {k: v.detach().clone() for k, v in model.named_parameters()}
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in model.state_dict().items():
+        if _is_float_tensor(v):
+            out[k] = v.detach().clone()
+    return out
+
+
+
+def params_only_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Trainable-parameter-only state dict (excludes all buffers).
+
+    This matches the common theoretical notation θ ∈ R^P, where P counts only trainable parameters.
+    Keys follow model.named_parameters(), which align with state_dict() keys for parameters.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in model.named_parameters():
+        out[k] = v.detach().clone()
+    return out
+
+
+def load_params_only_state_dict_(model: nn.Module, state: Dict[str, torch.Tensor]) -> None:
+    """In-place load for parameter-only state dict."""
+    with torch.no_grad():
+        missing = [k for k, _ in model.named_parameters() if k not in state]
+        if missing:
+            raise KeyError(f"Missing param keys in state: {missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        for k, v in model.named_parameters():
+            v.copy_(state[k])
+
+
+def get_state_dict(model: nn.Module, mode: str = "float") -> Dict[str, torch.Tensor]:
+    """Return a state dict under the requested mode.
+
+    mode:
+      - "float": parameters + floating buffers (BatchNorm running stats included)
+      - "params": trainable parameters only (buffers excluded)
+    """
+    mode = str(mode).lower().strip()
+    if mode == "float":
+        return param_state_dict(model)
+    if mode in ("params", "param", "parameters"):
+        return params_only_state_dict(model)
+    raise ValueError(f"Unknown state mode: {mode}")
+
+
+def load_state_dict_(model: nn.Module, state: Dict[str, torch.Tensor], mode: str = "float") -> None:
+    """Load a state dict produced by get_state_dict()."""
+    mode = str(mode).lower().strip()
+    if mode == "float":
+        load_param_state_dict_(model, state)
+        return
+    if mode in ("params", "param", "parameters"):
+        load_params_only_state_dict_(model, state)
+        return
+    raise ValueError(f"Unknown state mode: {mode}")
 
 
 def load_param_state_dict_(model: nn.Module, state: Dict[str, torch.Tensor]) -> None:
-    """
-    In-place load of parameter-only state.
-    """
+    """In-place load of floating-point state (parameters + floating buffers)."""
     with torch.no_grad():
-        for k, p in model.named_parameters():
-            if k not in state:
-                raise KeyError(f"Missing key in param state: {k}")
-            p.copy_(state[k])
+        model_sd = model.state_dict()
+        float_keys = [k for k, v in model_sd.items() if _is_float_tensor(v)]
+        missing = [k for k in float_keys if k not in state]
+        if missing:
+            raise KeyError(f"Missing float keys in state: {missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        for k in float_keys:
+            model_sd[k].copy_(state[k])
 
 
 def zero_like(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: torch.zeros_like(v) for k, v in state.items()}
 
 
-def sub_state(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {k: (a[k] - b[k]) for k in a.keys()}
-
-
 def add_state_(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor], scale: float = 1.0) -> None:
     with torch.no_grad():
         for k in a.keys():
-            a[k].add_(b[k], alpha=scale)
+            a[k].add_(b[k], alpha=float(scale))
 
 
 def scale_state_(a: Dict[str, torch.Tensor], scale: float) -> None:
     with torch.no_grad():
         for k in a.keys():
-            a[k].mul_(scale)
+            a[k].mul_(float(scale))
 
 
-def fedavg_aggregate(server_params: Dict[str, torch.Tensor], deltas: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """
-    Uniform FedAvg over parameter deltas (client_params - server_params).
-    """
+def fedavg_aggregate(server_state: Dict[str, torch.Tensor], deltas: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     if len(deltas) == 0:
-        return server_params
+        return server_state
 
-    avg_delta = zero_like(server_params)
+    avg_delta = zero_like(server_state)
     for d in deltas:
         add_state_(avg_delta, d, scale=1.0)
     scale_state_(avg_delta, 1.0 / len(deltas))
 
-    new_params = {k: server_params[k] + avg_delta[k] for k in server_params.keys()}
-    return new_params
+    return {k: server_state[k] + avg_delta[k] for k in server_state.keys()}
 
 
 def uplink_bytes_for_delta(delta: Dict[str, torch.Tensor]) -> int:
-    """
-    Bytes transmitted client->server if sending full-precision delta tensors.
-    """
     total = 0
     for t in delta.values():
         total += t.numel() * t.element_size()
@@ -91,10 +142,27 @@ def uplink_bytes_for_delta(delta: Dict[str, torch.Tensor]) -> int:
 
 
 @torch.no_grad()
+def bn_recalibrate(model: nn.Module, loader: DataLoader, device: torch.device, num_batches: int = 20) -> None:
+    """
+    Recompute BatchNorm running stats by running a few batches in train() mode
+    without gradient updates.
+    """
+    was_training = bool(model.training)
+    model.train(True)
+
+    n = 0
+    for x, _ in loader:
+        x = x.to(device, non_blocking=True)
+        _ = model(x)
+        n += 1
+        if n >= int(num_batches):
+            break
+
+    model.train(was_training)
+
+
+@torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
-    """
-    Returns (avg_loss, accuracy)
-    """
     model.eval()
     total_loss = 0.0
     total = 0
@@ -121,19 +189,15 @@ def make_loader(
     shuffle: bool,
     seed_train: int,
     device: torch.device,
+    num_workers: int = 0,
 ) -> DataLoader:
-    """
-    Deterministic DataLoader:
-    - single worker (num_workers=0) to avoid worker seeding complexity
-    - uses a per-loader torch.Generator for deterministic shuffles
-    """
     g = torch.Generator(device="cpu")
-    g.manual_seed(seed_train)
+    g.manual_seed(int(seed_train))
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
         pin_memory=(device.type == "cuda"),
         generator=g if shuffle else None,
     )
@@ -149,19 +213,17 @@ def local_train_sgd(
     weight_decay: float,
     seed_train: int,
 ) -> float:
-    """
-    Minimal local SGD training. Returns average train loss over all samples.
-    """
-    # Per-client determinism: re-seed torch before local training loop.
-    torch.manual_seed(seed_train)
+    torch.manual_seed(int(seed_train))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed_train))
 
     model.train()
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    opt = torch.optim.SGD(model.parameters(), lr=float(lr), momentum=float(momentum), weight_decay=float(weight_decay))
 
     total_loss = 0.0
     total = 0
 
-    for _ in range(epochs):
+    for _ in range(int(epochs)):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -172,21 +234,14 @@ def local_train_sgd(
             loss.backward()
             opt.step()
 
-            total_loss += float(loss.item()) * int(y.numel())
-            total += int(y.numel())
+            bs = int(y.numel())
+            total_loss += float(loss.item()) * bs
+            total += bs
 
     return total_loss / max(1, total)
 
-# ============================================================
-# Runner base classes (public API for algorithms package)
-# ============================================================
 
 class BaseRunner:
-    """
-    Public base runner interface exported by algorithms package.
-    All algorithm runners should implement:
-      run_round(...) -> (train_loss: float, uplink_bytes: int)
-    """
     def __init__(self, device: torch.device) -> None:
         self.device = device
 
@@ -195,15 +250,6 @@ class BaseRunner:
 
 
 class FedAvgRunner(BaseRunner):
-    """
-    Simple FedAvg baseline runner.
-    Uses:
-      - param_state_dict / load_param_state_dict_
-      - local_train_sgd (defined in this file)
-      - uplink_bytes_for_delta
-      - fedavg_aggregate
-    """
-
     def __init__(self, model: nn.Module, device: torch.device) -> None:
         super().__init__(device=device)
         self.model = model.to(device)
@@ -218,7 +264,7 @@ class FedAvgRunner(BaseRunner):
     ) -> Tuple[float, int]:
         lr, momentum, weight_decay = sgd_cfg
 
-        server_params = param_state_dict(self.model)
+        server_state = param_state_dict(self.model)
         deltas: List[Dict[str, torch.Tensor]] = []
         uplink = 0
         losses: List[float] = []
@@ -227,7 +273,7 @@ class FedAvgRunner(BaseRunner):
             cid_int = int(cid)
 
             local = copy.deepcopy(self.model)
-            load_param_state_dict_(local, server_params)
+            load_param_state_dict_(local, server_state)
 
             loss = local_train_sgd(
                 model=local,
@@ -239,15 +285,15 @@ class FedAvgRunner(BaseRunner):
                 weight_decay=float(weight_decay),
                 seed_train=int(seed_train) + cid_int,
             )
-            losses.append(loss)
+            losses.append(float(loss))
 
-            client_params = param_state_dict(local)
-            delta = {k: (client_params[k] - server_params[k]) for k in server_params.keys()}
+            client_state = param_state_dict(local)
+            delta = {k: (client_state[k] - server_state[k]) for k in server_state.keys()}
             deltas.append(delta)
             uplink += uplink_bytes_for_delta(delta)
 
         if deltas:
-            new_params = fedavg_aggregate(server_params, deltas)
-            load_param_state_dict_(self.model, new_params)
+            new_state = fedavg_aggregate(server_state, deltas)
+            load_param_state_dict_(self.model, new_state)
 
         return float(np.mean(losses)) if losses else 0.0, int(uplink)
