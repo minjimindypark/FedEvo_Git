@@ -7,10 +7,80 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from algorithms.base import evaluate, make_loader, set_global_seed, bn_recalibrate
+from algorithms.base import evaluate, make_loader, set_global_seed, bn_recalibrate, FedAvgRunner
 from algorithms.fedevo import FedEvoRunner, GAConfig, FedEvoClient
 from data_utils import client_train_val_split, dirichlet_partition, iid_partition, load_cifar, make_subset
 from models import ResNet18_CIFAR
+
+import random
+
+def _save_checkpoint(
+    path: str,
+    *,
+    algo: str,
+    args_dict: dict,
+    round_idx: int,
+    lr_current: float,
+    schedule: list,
+    runner,
+) -> None:
+    ckpt = {
+        "algo": str(algo),
+        "args": dict(args_dict),
+        "meta": {
+        "dataset": args_dict.get("dataset"),
+        "model": "ResNet18_CIFAR",
+        "state_mode": str(args_dict.get("state_mode")),
+        "m": int(args_dict.get("m")) if args_dict.get("m") is not None else None,
+        "num_clients": int(args_dict.get("num_clients")) if args_dict.get("num_clients") is not None else None,
+        "clients_per_round": int(args_dict.get("clients_per_round")) if args_dict.get("clients_per_round") is not None else None,
+        "num_classes": int(args_dict.get("num_classes")) if args_dict.get("num_classes") is not None else None,
+        },
+        "round_idx": int(round_idx),       # next round to run (0-based)
+        "lr_current": float(lr_current),
+        "schedule": schedule,
+        # Global RNG states (for exact reproducibility)
+        "py_random_state": random.getstate(),
+        "np_random_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+        "torch_cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+    if str(algo) == "fedevo":
+        ckpt["fedevo"] = {
+            "ga": runner.ga.__dict__,
+            "state_mode": runner.state_mode,
+            "num_classes": runner.num_classes,
+            "round_idx_runner": runner.round_idx,
+            "theta_base": runner.theta_base,
+            "population": runner.population,
+            "rng_state": runner.rng.get_state(),
+            "_delta_cache_by_cid": runner._delta_cache_by_cid,
+            "_delta_cache_fifo": runner._delta_cache_fifo,
+            "_delta_cache_max": runner._delta_cache_max,
+        }
+    else:
+        # FedAvg
+        ckpt["fedavg"] = {
+            "state_mode": runner.state_mode,
+            "model_state": runner.model.state_dict(),
+        }
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(ckpt, path)
+
+
+def _load_checkpoint(path: str, *, device: torch.device):
+    ckpt = torch.load(path, map_location=device)
+
+    # Restore RNG
+    random.setstate(ckpt["py_random_state"])
+    np.random.set_state(ckpt["np_random_state"])
+    torch.set_rng_state(ckpt["torch_rng_state"])
+    if torch.cuda.is_available() and ckpt.get("torch_cuda_rng_state_all") is not None:
+        torch.cuda.set_rng_state_all(ckpt["torch_cuda_rng_state_all"])
+
+    return ckpt
 
 
 def build_client_schedule(num_clients: int, clients_per_round: int, rounds: int, seed: int) -> List[List[int]]:
@@ -48,6 +118,8 @@ def main() -> None:
     parser.add_argument("--num_orth", type=int, default=1, help="Number of orthogonality injections")
 
     parser.add_argument("--no_mutation", action="store_true", help="Disable mutation")
+    parser.add_argument("--no_mut", action="store_true", help="Alias of --no_mutation")
+
     parser.add_argument("--no_orth", action="store_true", help="Disable orthogonality injection")
 
     parser.add_argument("--val_batches", type=int, default=None, help="Limit validation batches")
@@ -71,6 +143,10 @@ def main() -> None:
     parser.add_argument("--bn_recalibrate_batches", type=int, default=0,
                         help="If >0, run BN recalibration for this many batches on train_plain before evaluation (helps when state_mode=params).")
 
+    parser.add_argument("--resume", type=str, default="", help="Path to a checkpoint .pt to resume from")
+    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N rounds (0 disables)")
+    parser.add_argument("--ckpt_dir", type=str, default="", help="Directory to save checkpoints (default: out_dir)")
+
     # aliases (optional)
     parser.add_argument("--local_steps", type=int, default=None, help="Alias of --epochs")
     parser.add_argument("--topk_rho", type=float, default=None, help="Alias of --rho")
@@ -78,10 +154,12 @@ def main() -> None:
     parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
     parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
     parser.add_argument("--seed_group_size", type=int, default=0, help="(Not used) accepted for compatibility")
-    parser.add_argument("--algo", type=str, default="fedevo", help="(Not used) accepted for compatibility")
+    parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg"],
+                        help="Which algorithm to run")
+
 
     args = parser.parse_args()
-
+    args.no_mutation = bool(args.no_mutation) or bool(args.no_mut)
     if args.local_steps is not None:
         args.epochs = args.local_steps
     if args.topk_rho is not None:
@@ -100,7 +178,10 @@ def main() -> None:
         os.makedirs(args.out_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         alpha_str = args.alpha.replace(".", "p")
-        out_csv_path = os.path.join(args.out_dir, f"fedevo_{args.dataset}_alpha{alpha_str}_r{args.rounds}_{timestamp}.csv")
+        out_csv_path = os.path.join(
+            args.out_dir,
+            f"{args.algo}_{args.dataset}_alpha{alpha_str}_r{args.rounds}_{timestamp}.csv"
+        )
 
     print(f"[Setup] Device: {device}")
     print(f"[Setup] Output: {out_csv_path}")
@@ -132,64 +213,143 @@ def main() -> None:
 
     print(f"[Data] Train: {len(bundle.train_dataset)}, Test: {len(bundle.test_dataset)}")
 
-    ga_config = GAConfig(
-        state_mode=str(args.state_mode),
-        m=args.m,
-        rho=args.rho,
-        gamma=args.gamma,
-        tau_factor=args.tau_factor,
-        sigma_mut=args.sigma_mut,
-        num_interp=args.num_interp,
-        num_orth=args.num_orth,
-        enable_mutation=not args.no_mutation,
-        enable_orth_injection=not args.no_orth,
-    )
+    # --- runner selection (FedEvo vs FedAvg) ---
+    if args.algo == "fedevo":
+        ga_config = GAConfig(
+            state_mode=str(args.state_mode),
+            m=args.m,
+            seed_group_size=args.seed_group_size,
+            rho=args.rho,
+            gamma=args.gamma,
+            tau_factor=args.tau_factor,
+            sigma_mut=args.sigma_mut,
+            num_interp=args.num_interp,
+            num_orth=args.num_orth,
+            enable_mutation=not args.no_mutation,
+            enable_orth_injection=not args.no_orth,
+            warmup_no_orth_rounds=args.orth_warmup_rounds,
+            warmup_no_mut_rounds=args.mut_warmup_rounds,
 
-    runner = FedEvoRunner(
-        model_ctor=ResNet18_CIFAR,
-        num_classes=bundle.num_classes,
-        device=device,
-        ga=ga_config,
-        seed=args.seed_evo,
-        val_batches=args.val_batches,
-        weight_by_samples=not args.no_weight_by_samples,
-        deterministic=bool(args.deterministic),
-    )
+        )
 
-    print(f"[FedEvo] Population size m={args.m}, rho={args.rho}, gamma={args.gamma}")
-    print(f"[FedEvo] Mutation: {ga_config.enable_mutation}, Orthogonality: {ga_config.enable_orth_injection}")
+        runner = FedEvoRunner(
+            model_ctor=ResNet18_CIFAR,
+            num_classes=bundle.num_classes,
+            device=device,
+            ga=ga_config,
+            seed=args.seed_evo,
+            val_batches=args.val_batches,
+            weight_by_samples=not args.no_weight_by_samples,
+            deterministic=bool(args.deterministic),
+        )
+    # --- nice, unambiguous run header ---
+    if args.algo == "fedevo":
+        # ga_config는 FedEvo일 때만 존재하므로 여기에서만 사용
+        print(
+            "[Run] algo=fedevo "
+            f"dataset={args.dataset} alpha={args.alpha} rounds={args.rounds} "
+            f"m={args.m} rho={args.rho} gamma={args.gamma} tau_factor={args.tau_factor} "
+            f"mutation={ga_config.enable_mutation} orth={ga_config.enable_orth_injection} "
+            f"state_mode={args.state_mode} bn_recalib={args.bn_recalibrate_batches}"
+        )
+    else:
+        model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
+        runner = FedAvgRunner(model=model, device=device, state_mode=str(args.state_mode))
+        print(
+            "[Run] algo=fedavg "
+            f"dataset={args.dataset} alpha={args.alpha} rounds={args.rounds} "
+            f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
+            f"state_mode={args.state_mode} bn_recalib={args.bn_recalibrate_batches}"
+        )
 
-    schedule = build_client_schedule(args.num_clients, args.clients_per_round, args.rounds, args.seed_sample)
-
+    # ===== Resume / schedule / CSV mode =====
+    r_start = 0
     lr_current = float(args.lr)
+    schedule = None
 
-    with open(out_csv_path, "w", newline="") as f:
+    ckpt = None
+    if args.resume and args.resume.strip():
+        ckpt = _load_checkpoint(args.resume, device=device)
+
+    meta = (ckpt.get("meta", {}) if ckpt is not None else {}) or {}
+    mismatches = []
+
+    def _mm(key: str, got, exp):
+        if got is None or exp is None:
+            return
+        if got != exp:
+            mismatches.append(f"{key}: ckpt={got} vs args={exp}")
+
+    _mm("dataset", meta.get("dataset"), args.dataset)
+    _mm("state_mode", meta.get("state_mode"), str(args.state_mode))
+    _mm("m", meta.get("m"), int(args.m))
+    _mm("num_clients", meta.get("num_clients"), int(args.num_clients))
+    _mm("clients_per_round", meta.get("clients_per_round"), int(args.clients_per_round))
+
+    if mismatches:
+        raise ValueError(
+            "[Resume Error] Incompatible checkpoint for current run:\n  - "
+            + "\n  - ".join(mismatches)
+            + "\nFix: resume with matching arguments or start a new run (remove --resume)."
+        )
+
+    # ---- resume apply (only when ckpt exists) ----
+    if ckpt is not None:
+        r_start = int(ckpt["round_idx"])
+        lr_current = float(ckpt["lr_current"])
+        schedule = ckpt["schedule"]
+        print(f"[Resume] Loaded checkpoint={args.resume} -> start_round={r_start}, lr={lr_current:.6f}")
+
+    # Build schedule if not resumed
+    if schedule is None:
+        schedule = build_client_schedule(args.num_clients, args.clients_per_round, args.rounds, args.seed_sample)
+
+    # Checkpoint path
+    ckpt_dir = args.ckpt_dir.strip() or args.out_dir
+    os.makedirs(ckpt_dir, exist_ok=True)
+    last_ckpt_path = os.path.join(ckpt_dir, "last.pt")
+
+    # CSV open mode: new run -> write, resume -> append
+    csv_mode = "a" if (args.resume and args.resume.strip()) else "w"
+    need_header = (csv_mode == "w") or (not os.path.exists(out_csv_path)) or (os.path.getsize(out_csv_path) == 0)
+
+    with open(out_csv_path, csv_mode, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["round", "test_accuracy", "train_loss", "uplink_bytes", "learning_rate"])
-        writer.writeheader()
+        if need_header:
+            writer.writeheader()
 
-        for r in range(int(args.rounds)):
+        for r in range(int(r_start), int(args.rounds)):
             client_ids = schedule[r]
 
-            clients = [
-                FedEvoClient(
-                    cid=int(cid),
-                    train_loader=client_train_loaders[int(cid)],
-                    val_loader=client_val_loaders[int(cid)],
+            if args.algo == "fedevo":
+                clients = [
+                    FedEvoClient(
+                        cid=int(cid),
+                        train_loader=client_train_loaders[int(cid)],
+                        val_loader=client_val_loaders[int(cid)],
+                    )
+                    for cid in client_ids
+                ]
+
+                train_loss, uplink_bytes = runner.run_round(
+                    clients=clients,
+                    epochs=args.epochs,
+                    sgd_cfg=(lr_current, args.momentum, args.weight_decay),
+                    seed_train=args.seed_train,
                 )
-                for cid in client_ids
-            ]
-
-            train_loss, uplink_bytes = runner.run_round(
-                clients=clients,
-                epochs=args.epochs,
-                sgd_cfg=(lr_current, args.momentum, args.weight_decay),
-                seed_train=args.seed_train,
-            )
-
-            deploy_model = runner.get_deploy_model(policy=str(args.deploy_model))
+                deploy_model = runner.get_deploy_model(policy=str(args.deploy_model))
+            else:
+                train_loss, uplink_bytes = runner.run_round(
+                    client_ids=client_ids,
+                    client_train_loaders=client_train_loaders,
+                    epochs=args.epochs,
+                    sgd_cfg=(lr_current, args.momentum, args.weight_decay),
+                    seed_train=args.seed_train,
+                    weight_by_samples=not args.no_weight_by_samples,
+                )
+                deploy_model = runner.model
 
             if int(args.bn_recalibrate_batches) > 0:
-                # Recalibrate BN running stats using a small number of batches from train_plain.
                 bn_loader = make_loader(
                     bundle.train_plain_dataset,
                     batch_size=200,
@@ -211,6 +371,19 @@ def main() -> None:
                 }
             )
             f.flush()
+
+            # Save checkpoint
+            if int(args.save_every) > 0 and (((r + 1) % int(args.save_every) == 0) or ((r + 1) == int(args.rounds))):
+                _save_checkpoint(
+                    last_ckpt_path,
+                    algo=args.algo,
+                    args_dict=vars(args),
+                    round_idx=r + 1,      # next round
+                    lr_current=lr_current,
+                    schedule=schedule,
+                    runner=runner,
+                )
+                print(f"[CKPT] saved: {last_ckpt_path} (next_round={r+1})")
 
             lr_current = lr_current * float(args.lr_decay)
 

@@ -250,9 +250,10 @@ class BaseRunner:
 
 
 class FedAvgRunner(BaseRunner):
-    def __init__(self, model: nn.Module, device: torch.device) -> None:
+    def __init__(self, model: nn.Module, device: torch.device, state_mode: str = "float") -> None:
         super().__init__(device=device)
         self.model = model.to(device)
+        self.state_mode = str(state_mode).lower().strip()
 
     def run_round(
         self,
@@ -261,39 +262,60 @@ class FedAvgRunner(BaseRunner):
         epochs: int,
         sgd_cfg: Tuple[float, float, float],
         seed_train: int,
+        weight_by_samples: bool = True,
     ) -> Tuple[float, int]:
         lr, momentum, weight_decay = sgd_cfg
 
-        server_state = param_state_dict(self.model)
+        # server state under requested mode
+        server_state = get_state_dict(self.model, mode=self.state_mode)
+
+        # accumulate weighted delta
         deltas: List[Dict[str, torch.Tensor]] = []
+        weights: List[float] = []
         uplink = 0
         losses: List[float] = []
 
         for cid in client_ids:
             cid_int = int(cid)
 
+            # local model = copy of server
             local = copy.deepcopy(self.model)
-            load_param_state_dict_(local, server_state)
+            load_state_dict_(local, server_state, mode=self.state_mode)
 
+            # train
             loss = local_train_sgd(
                 model=local,
                 loader=client_train_loaders[cid_int],
-                device=self.device,
                 epochs=int(epochs),
                 lr=float(lr),
                 momentum=float(momentum),
                 weight_decay=float(weight_decay),
                 seed_train=int(seed_train) + cid_int,
+                device=self.device,
             )
             losses.append(float(loss))
 
-            client_state = param_state_dict(local)
+            # delta
+            client_state = get_state_dict(local, mode=self.state_mode)
             delta = {k: (client_state[k] - server_state[k]) for k in server_state.keys()}
             deltas.append(delta)
+
+            # weights (optional)
+            n_samples = len(client_train_loaders[cid_int].dataset)
+            weights.append(float(n_samples) if weight_by_samples else 1.0)
+
+            # uplink bytes
             uplink += uplink_bytes_for_delta(delta)
 
+        # aggregate
         if deltas:
-            new_state = fedavg_aggregate(server_state, deltas)
-            load_param_state_dict_(self.model, new_state)
+            # weighted average delta
+            wsum = float(sum(weights))
+            avg_delta = zero_like(server_state)
+            for d, w in zip(deltas, weights):
+                add_state_(avg_delta, d, scale=(w / max(wsum, 1e-12)))
+            new_state = {k: server_state[k] + avg_delta[k] for k in server_state.keys()}
+            load_state_dict_(self.model, new_state, mode=self.state_mode)
 
         return float(np.mean(losses)) if losses else 0.0, int(uplink)
+

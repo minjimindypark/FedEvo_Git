@@ -74,7 +74,7 @@ def _eval_loss_limited(
         return float("inf")
     return float(total_loss / max(1, total_n))
 
-def _local_train_sgd(
+def local_train_sgd(
     *,
     model: nn.Module,
     loader,
@@ -138,7 +138,6 @@ class GAConfig:
 
     lam_low: float = 0.4
     lam_high: float = 0.6
-
     tau_factor: float = 0.8
     sigma_mut: float = 0.01
     mutate_frac_layers: float = 0.33
@@ -241,7 +240,7 @@ class FedEvoClient:
         model = model_ctor(int(num_classes)).to(device)
         load_state_dict_(model, selected_state, mode=state_mode)
 
-        loss, n_samples = _local_train_sgd(
+        loss, n_samples = local_train_sgd(
             model=model,
             loader=self.train_loader,
             epochs=int(epochs),
