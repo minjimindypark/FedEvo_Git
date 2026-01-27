@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+
+def _reset_bn_running_stats(model: nn.Module) -> None:
+    """Reset BatchNorm running stats to avoid cross-round contamination when reusing a cached model."""
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.reset_running_stats()
+
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -73,6 +80,7 @@ def _eval_loss_limited(
     if total_n == 0:
         return float("inf")
     return float(total_loss / max(1, total_n))
+
 
 def local_train_sgd(
     *,
@@ -217,7 +225,9 @@ class FedEvoClient:
 
         if len(best_js) == 0:
             return 0
-        return int(np.random.choice(best_js))
+        # Deterministic tie-break (paper: epsilon-tolerant, deterministic)
+        # Choose the smallest candidate index among ties to ensure reproducibility.
+        return int(min(best_js))
 
     def local_update(
         self,
@@ -300,6 +310,39 @@ class FedEvoClient:
         return int(j_star), delta, int(n), float(train_loss)
 
 class FedEvoRunner:
+    
+    
+class FedEvoRunner:
+
+
+    def _sample_two_parents(self, p):
+
+        p = np.asarray(p, dtype=np.float64).copy()
+        m = int(p.shape[0])
+        if m < 2:
+            raise ValueError(f"Need at least 2 candidates, got m={m}")
+
+        p[~np.isfinite(p)] = 0.0
+        p[p < 0.0] = 0.0
+        s = float(p.sum())
+        p = (np.ones(m) / m) if s <= 0.0 else (p / s)
+
+        p_idx = int(self.rng.choice(m, p=p))  # reproducible RNG
+
+        p2 = p.copy()
+        p2[p_idx] = 0.0
+        s2 = float(p2.sum())
+        if s2 <= 0.0:
+            p2 = np.ones(m, dtype=np.float64)
+            p2[p_idx] = 0.0
+            p2 /= float(p2.sum())
+        else:
+            p2 /= s2
+
+        q_idx = int(self.rng.choice(m, p=p2))
+        return p_idx, q_idx
+
+
     def __init__(
         self,
         model_ctor,
@@ -364,6 +407,103 @@ class FedEvoRunner:
             noise = torch.randn_like(w.float()) * sigma
             sd[k] = (w.float() + noise).to(w.dtype)
 
+
+    def get_deploy_model(self, policy: str = "topk") -> nn.Module:
+        """Return an nn.Module for evaluation/deployment.
+
+        IMPORTANT: main.py expects an nn.Module because bn_recalibrate/evaluate call .train()/.eval().
+
+        policy:
+          - base: theta_base
+          - stab: last stabilizer (if available)
+          - used: last usage anchor (if available)
+          - topk: last top-k aggregated candidate (default, if available)
+          - best: best post-trained candidate from last round by usage_counts
+        """
+        import numpy as _np
+
+        pol = (policy or "topk").lower()
+
+        # Choose state_dict source (ALL are sentinel-free state_dicts)
+        if pol == "base":
+            sd = self.theta_base
+        elif pol == "stab":
+            sd = getattr(self, "last_theta_stab", None) or getattr(self, "theta_stab_last", None) or self.theta_base
+        elif pol == "used":
+            sd = getattr(self, "last_theta_used", None) or getattr(self, "theta_used_last", None) or self.theta_base
+        elif pol == "topk":
+            sd = getattr(self, "last_theta_topk", None) or getattr(self, "theta_topk_last", None) or self.theta_base
+        elif pol == "best":
+            bars = getattr(self, "last_theta_bars", None) or getattr(self, "theta_bars_last", None)
+            usage = getattr(self, "last_usage_counts", None) or getattr(self, "usage_counts_last", None)
+            if bars is not None and usage is not None and len(bars) == len(usage) and len(bars) > 0:
+                j = int(_np.argmax(_np.asarray(usage, dtype=_np.int64)))
+                sd = bars[j]
+            else:
+                sd = getattr(self, "last_theta_topk", None) or getattr(self, "theta_topk_last", None) or self.theta_base
+        else:
+            sd = getattr(self, "last_theta_topk", None) or getattr(self, "theta_topk_last", None) or self.theta_base
+
+        # Reuse a cached model instance to avoid per-round construction overhead.
+
+
+        # IMPORTANT: We still (a) reset BN running stats, then (b) load the latest params each call.
+
+
+        if not hasattr(self, "_deploy_model_cache"):
+
+
+            self._deploy_model_cache = None
+
+
+            self._deploy_model_cache_num_classes = None
+
+
+            self._deploy_model_cache_device = None
+
+
+        dev_str = str(self.device)
+
+
+        need_new = (
+
+
+            self._deploy_model_cache is None
+
+
+            or self._deploy_model_cache_num_classes != self.num_classes
+
+
+            or self._deploy_model_cache_device != dev_str
+
+
+        )
+
+
+        if need_new:
+
+
+            self._deploy_model_cache = self.model_ctor(self.num_classes).to(self.device)
+
+
+            self._deploy_model_cache_num_classes = self.num_classes
+
+
+            self._deploy_model_cache_device = dev_str
+
+
+        model: nn.Module = self._deploy_model_cache
+
+
+        _reset_bn_running_stats(model)
+
+
+        load_state_dict_(model, sd, mode=self.state_mode)
+
+
+        return model
+    
+    
     def run_round(
         self,
         clients: Sequence[FedEvoClient],
@@ -389,7 +529,7 @@ class FedEvoRunner:
         uplink_bytes = 0
 
         # Collect per-client deltas for warm-start cache update (used by seeding).
-        round_delta_base_by_cid: Dict[int, Tuple[Dict[str, torch.Tensor], int]] = {}
+        round_abs_by_cid: Dict[int, Tuple[Dict[str, torch.Tensor], int]] = {}
 
         for client in St:
             cid = int(client.cid)
@@ -421,15 +561,21 @@ class FedEvoRunner:
             delta_base = {k: (delta_cand[k].float() + (self.population[j_star][k].float() - self.theta_base[k].float())).to(delta_cand[k].dtype) for k in self.state_keys}
             all_deltas_base.append(delta_base)
             all_samples.append(int(n_samples))
-            round_delta_base_by_cid[cid] = (delta_base, int(n_samples))
+            theta_abs = {k: (self.population[j_star][k].float() + delta_cand[k].float()).to(self.population[j_star][k].dtype) for k in self.state_keys}
+            round_abs_by_cid[cid] = (theta_abs, int(n_samples))
 
-        # Update warm-start cache with latest (delta_base, n_samples) per participating client.
-        for cid, (d_base, n_samp) in round_delta_base_by_cid.items():
-            self._delta_cache_by_cid[int(cid)] = (_clone_state(d_base), int(n_samp))
-            self._delta_cache_fifo.append((_clone_state(d_base), int(n_samp)))
+        # Update warm-start cache with latest (theta_abs, n_samples) per participating client.
+        # NOTE: We cache absolute client post-local states to avoid coordinate-frame drift when the base changes across rounds.
+        for cid, (theta_abs, n_samp) in round_abs_by_cid.items():
+            self._delta_cache_by_cid[int(cid)] = (_clone_state(theta_abs), int(n_samp))
+            self._delta_cache_fifo.append((_clone_state(theta_abs), int(n_samp)))
         # Keep cache bounded (FIFO).
-        if len(self._delta_cache_fifo) > self._delta_cache_max:
-            self._delta_cache_fifo = self._delta_cache_fifo[-self._delta_cache_max :]
+        if self._delta_cache_max <= 0:
+            # Guard: if seed_group_size=0 (or any config yields 0), disable FIFO cache to avoid unbounded growth.
+            self._delta_cache_fifo.clear()
+        elif len(self._delta_cache_fifo) > self._delta_cache_max:
+            self._delta_cache_fifo = self._delta_cache_fifo[-self._delta_cache_max:]
+
 
         self.last_usage_counts = usage_counts.tolist()
 
@@ -534,7 +680,10 @@ class FedEvoRunner:
         if bool(self.ga.enable_seed_fill):
             # Use the stabilizer as the reference base for seeding P(t+1).
             while len(next_pop) < m and len(self._delta_cache_fifo) > 0:
-                next_pop.append(self._seed_one_candidate_from_warm_cache(theta_stab, St))
+                cand = self._seed_one_candidate_from_warm_cache(base_sd=theta_stab, participants=St)
+                if cand is None:
+                    break
+                next_pop.append(cand)
 
         while len(next_pop) < m:
             p_idx, q_idx = self._sample_two_parents(p)
@@ -544,12 +693,23 @@ class FedEvoRunner:
         next_pop = next_pop[:m]
 
         enable_mut_now = bool(self.ga.enable_mutation) and (int(self.round_idx) > int(self.ga.warmup_no_mut_rounds))
+        mut_src: List[int] = []
         if enable_mut_now and (H < tau):
-            next_pop = self._apply_mutation(next_pop, usage_counts)
+            mutants, mut_src = self._make_mutants_from_top(theta_bars, usage_counts)
+
+            # Replace tail slots (excluding anchors 0..2) so mutants are never silently dropped.
+            num_mut = min(len(mutants), max(0, m - 3))
+            slots = list(range(m - 1, m - 1 - num_mut, -1))
+            for s, mu in zip(slots, mutants[:num_mut]):
+                next_pop[s] = _clone_state(mu)
+
+            if num_mut > 0:
+                print(f"[FedEvo R{self.round_idx}] mutation_from={mut_src[:num_mut]} -> slots={slots}")
 
         self.population = next_pop
-        self.theta_base = _clone_state(theta_stab)
+        old_base = _clone_state(self.theta_base)  # debug: keep previous base for logging
 
+        self.theta_base = _clone_state(theta_stab)
         # Cache round products for deployment/evaluation
         self.last_usage_counts = [int(x) for x in usage_counts.tolist()]
         self.last_entropy = float(H)
@@ -562,7 +722,7 @@ class FedEvoRunner:
         if getattr(self.ga, "debug_diag", False):
             stab_update_norm = float(torch.norm(_flatten(avg_delta_base, self.param_only_keys)).item())
             cand_update_norm = float(torch.norm(_flatten(avg_delta_cand, self.param_only_keys)).item())
-            base_norm = float(torch.norm(_flatten(self.theta_base, self.param_only_keys)).item())
+            base_norm = float(torch.norm(_flatten(old_base, self.param_only_keys)).item())
             stab_norm = float(torch.norm(_flatten(theta_stab, self.param_only_keys)).item())
             top1 = int(np.argmax(usage_counts)) if usage_counts.size > 0 else -1
 
@@ -581,240 +741,122 @@ class FedEvoRunner:
 
     def _seed_one_candidate_from_warm_cache(
         self,
+        *,
         base_sd: Dict[str, torch.Tensor],
         participants: Sequence[FedEvoClient],
-    ) -> Dict[str, torch.Tensor]:
-        """Seed a candidate as base + Avg(warm cached deltas) over a random group.
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Seed one candidate from warm cache.
 
-        This implements the paper's seeding idea (Eq.(seed)) in simulator form:
-        - Partition (conceptually) participating clients into groups of size k.
-        - For each group, aggregate cached recent deltas for those clients (warm-start).
+        NOTE: The cache stores *absolute* states (theta_abs) of past client-local models.
+        To avoid coordinate drift across rounds (changing bases), we rebase each cached
+        theta_abs into the current base: delta_curr = theta_abs - base_sd, then average
+        deltas and add back to base_sd.
         """
         k = int(self.ga.seed_group_size)
         if k <= 0:
-            k = 1
+            return None
 
-        if len(participants) == 0:
-            cand = _clone_state(base_sd)
-            if float(self.ga.init_noise) > 0.0:
-                self._add_param_noise_inplace(cand, sigma_scale=float(self.ga.init_noise))
-            return cand
-
-        # Sample a group of clients (without replacement when possible).
-        replace = len(participants) < k
-        idx = self.rng.choice(len(participants), size=k, replace=replace)
-        group = [participants[int(i)] for i in idx]
+        # Pick a group of participants (prefer current round participants when possible).
+        if len(participants) > 0:
+            take = min(k, len(participants))
+            pick = self.rng.choice(len(participants), size=take, replace=False)
+            group = [participants[int(i)] for i in pick]
+        else:
+            group = []
 
         deltas: List[Dict[str, torch.Tensor]] = []
         weights: List[float] = []
+
+        # 1) Prefer per-client cache (cid-indexed) using current participants
         for c in group:
             cid = int(c.cid)
             if cid in self._delta_cache_by_cid:
-                d, n = self._delta_cache_by_cid[cid]
-                deltas.append(d)
+                theta_abs, n = self._delta_cache_by_cid[cid]
+                # Rebase to current base
+                delta_curr = {
+                    key: (theta_abs[key].float() - base_sd[key].float()).to(base_sd[key].dtype)
+                    for key in self.state_keys
+                }
+                deltas.append(delta_curr)
                 weights.append(float(n))
 
-        # Fallback: sample from global FIFO cache if none of the group has cached deltas yet.
+        # 2) Fallback: sample from FIFO cache if no usable per-cid entries were found
         if len(deltas) == 0 and len(self._delta_cache_fifo) > 0:
             take = min(k, len(self._delta_cache_fifo))
             pick = self.rng.choice(len(self._delta_cache_fifo), size=take, replace=False)
             for pi in pick:
-                d, n = self._delta_cache_fifo[int(pi)]
-                deltas.append(d)
+                theta_abs, n = self._delta_cache_fifo[int(pi)]
+                delta_curr = {
+                    key: (theta_abs[key].float() - base_sd[key].float()).to(base_sd[key].dtype)
+                    for key in self.state_keys
+                }
+                deltas.append(delta_curr)
                 weights.append(float(n))
 
-        cand = _clone_state(base_sd)
-        if len(deltas) > 0:
-            if self.weight_by_samples:
-                avg_d = _avg_state_dicts(deltas, self.state_keys, weights=weights)
-            else:
-                avg_d = _avg_state_dicts(deltas, self.state_keys, weights=None)
-            cand = _add_sd(cand, avg_d, self.state_keys)
+        if len(deltas) == 0:
+            return None
 
-        # Small noise helps prevent duplicates when cache is small.
-        if float(self.ga.init_noise) > 0.0:
-            self._add_param_noise_inplace(cand, sigma_scale=float(self.ga.init_noise))
+        avg_d = _avg_state_dicts(
+            deltas,
+            self.state_keys,
+            weights=weights if bool(self.weight_by_samples) else None,
+        )
+        cand = _add_sd(_clone_state(base_sd), avg_d, self.state_keys)
         return cand
 
-    def get_best_model(self) -> nn.Module:
-        """Backward-compat alias: returns the stabilizer/base model."""
-        return self.get_deploy_model(policy="stab")
 
-    def get_deploy_model(self, policy: str = "topk") -> nn.Module:
-        """Return a deploy/eval model according to the specified policy.
-
-        policy:
-          - "topk": selection-weighted top-k aggregate (Eq. (topk))
-          - "usage": most-selected candidate (argmax |S_j|)
-          - "stab": stabilizer/base (FedAvg-like)
-        """
-        policy = str(policy).lower().strip()
-        if policy not in ("topk", "usage", "stab"):
-            raise ValueError(f"Unknown deploy policy: {policy}")
-
-        if policy == "stab":
-            state = self.theta_base
-        elif policy == "topk":
-            state = getattr(self, "last_theta_topk", None) or self.theta_base
-        else:  # usage
-            usage = getattr(self, "last_usage_counts", None)
-            bars = getattr(self, "last_theta_bars", None)
-            if usage is None or bars is None or len(bars) == 0:
-                state = self.theta_base
-            else:
-                j = int(np.argmax(np.array(usage, dtype=np.int64)))
-                state = bars[j]
-
-        model = self.model_ctor(self.num_classes).to(self.device)
-        load_state_dict_(model, state, mode=self.state_mode)
-        return model
-
-    def _apply_mutation(self, pop: List[Dict[str, torch.Tensor]], usage_counts: np.ndarray) -> List[Dict[str, torch.Tensor]]:
-        m = len(pop)
-        zeta = float(self.ga.bottom_zeta)
-        num_rare = max(1, int(math.floor(zeta * m)))
-
-        order_asc = np.argsort(usage_counts)
-        rare_indices = [int(j) for j in order_asc[:num_rare]]
-
-        keep_unchanged = set(rare_indices[: max(0, int(self.ga.retain_rare_unchanged))])
-
-        for j in rare_indices:
-            if j in keep_unchanged:
-                continue
-            self._mutate_candidate_inplace(pop[j])
-
-        return pop
-
-    def _mutate_candidate_inplace(self, sd: Dict[str, torch.Tensor]) -> None:
-        num_layers = len(self.param_only_keys)
-        num_mutate = max(1, int(math.ceil(float(self.ga.mutate_frac_layers) * num_layers)))
-
-        layers_to_mutate = self.rng.choice(self.param_only_keys, size=num_mutate, replace=False)
-
-        for key in layers_to_mutate:
-            w = sd[key]
-            std = float(w.float().std().item())
-            if not np.isfinite(std) or std <= 0.0:
-                std = 1e-4
-
-            sigma = float(self.ga.sigma_mut) * std
-            noise = torch.randn_like(w.float()) * sigma
-            sd[key] = (w.float() + noise).to(w.dtype)
-
-    def _sample_two_parents(self, p: np.ndarray) -> Tuple[int, int]:
-        m = int(self.ga.m)
-        probs = p.astype(np.float64)
-        s = float(probs.sum())
-        if s <= 0:
-            idx = self.rng.choice(m, size=2, replace=False)
-            return int(idx[0]), int(idx[1])
-
-        probs = probs + 1e-8
-        probs = probs / (float(probs.sum()) + _EPS)
-
-        a = int(self.rng.choice(m, p=probs))
-        b = int(self.rng.choice(m, p=probs))
-        for _ in range(5):
-            if b != a:
-                break
-            b = int(self.rng.choice(m, p=probs))
-        if b == a:
-            b = (a + 1) % m
-        return a, b
-
-    def _sample_parents(self, p: np.ndarray, r: int) -> List[int]:
-        m = int(self.ga.m)
-        probs = p.astype(np.float64)
-        probs = probs + 1e-8
-        probs = probs / (float(probs.sum()) + _EPS)
-        return [int(x) for x in self.rng.choice(m, size=int(r), replace=True, p=probs)]
-
-    @torch.inference_mode()
-    def _client_select_best(self, val_loader) -> int:
-        best_loss = float("inf")
-        best_js: List[int] = []
-        eps = float(self.ga.tie_eps)
-
-        for j in range(int(self.ga.m)):
-            load_state_dict_(self._scratch_model, self.population[j], mode=self.state_mode)
-            loss = self._eval_loss_limited(self._scratch_model, val_loader)
-
-            if loss < best_loss - eps:
-                best_loss = loss
-                best_js = [j]
-            elif abs(loss - best_loss) <= eps:
-                best_js.append(j)
-
-        if not best_js:
-            return 0
-        return int(self.rng.choice(best_js))
-
-    @torch.inference_mode()
-    def _eval_loss_limited(self, model: nn.Module, loader) -> float:
-        model.eval()
-        total_loss, total_samples = 0.0, 0
-        batches = 0
-
-        for x, y in loader:
-            if self.val_batches is not None and batches >= int(self.val_batches):
-                break
-
-            x = x.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
-
-            logits = model(x)
-            loss = F.cross_entropy(logits, y, reduction="sum")
-
-            total_loss += float(loss.item())
-            total_samples += int(y.numel())
-            batches += 1
-
-        return total_loss / max(1, total_samples)
-
-    def _local_train(
+    def _make_mutants_from_top(
         self,
-        model: nn.Module,
-        loader,
-        epochs: int,
-        lr: float,
-        momentum: float,
-        weight_decay: float,
-        seed: int,
-    ) -> Tuple[float, int]:
-        torch.manual_seed(int(seed))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(seed))
+        theta_bars: List[Dict[str, torch.Tensor]],
+        usage_counts,
+    ) -> Tuple[List[Dict[str, torch.Tensor]], List[int]]:
+        """Create mutants by copying the single most-used candidate and applying Gaussian noise.
 
-        model.train()
-        optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=float(lr),
-            momentum=float(momentum),
-            weight_decay=float(weight_decay),
-        )
+        Minimal correctness conditions (submit-safe):
+        - best_j is defined in the current round's population slot index space (argmax over usage_counts).
+        - mutant source starts from theta_bars[best_j] (post-trained) to match the intended operator.
+        - returns (mutants, mut_src) where mut_src contains source indices for logging/debug.
+        """
+        if len(theta_bars) == 0:
+            return [], []
+        if len(usage_counts) != len(theta_bars):
+            # Defensive: keep index space consistent.
+            usage_counts = list(usage_counts)[: len(theta_bars)] + [0] * max(0, len(theta_bars) - len(usage_counts))
 
-        total_loss, total_samples = 0.0, 0
+        best_j = int(np.argmax(np.asarray(usage_counts, dtype=np.int64)))
+        src = theta_bars[best_j]
 
-        for _ in range(int(epochs)):
-            for x, y in loader:
-                x = x.to(self.device, non_blocking=True)
-                y = y.to(self.device, non_blocking=True)
+        # How many mutants to propose (upper-bounded later by m-3 in run_round).
+        # Use bottom_zeta as the mutation *rate* knob without changing the operator meaning.
+        num_mut = int(max(1, math.ceil(float(self.ga.bottom_zeta) * float(self.ga.m))))
+        sigma = float(self.ga.sigma_mut)
 
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(x)
-                loss = F.cross_entropy(logits, y)
-                loss.backward()
-                optimizer.step()
+        # Build a lightweight "layer" grouping by top-level module name.
+        # This keeps mutation localized and stable across architectures.
+        layer_names: List[str] = []
+        for k in self.param_only_keys:
+            ln = k.split(".")[0] if "." in k else k
+            if ln not in layer_names:
+                layer_names.append(ln)
+        # Choose which layers to mutate (fraction) -- sampled per mutant for diversity.
+        frac = float(self.ga.mutate_frac_layers)
+        n_layers = len(layer_names)
+        n_pick = int(max(1, math.ceil(frac * n_layers))) if n_layers > 0 else 0
+        mutants: List[Dict[str, torch.Tensor]] = []
+        mut_src: List[int] = []
+        for _ in range(num_mut):
+            mstate = _clone_state(src)
+            if n_layers > 0:
+                perm = torch.randperm(n_layers)
+                picked = {layer_names[int(i)] for i in perm[:n_pick].tolist()}
+            else:
+                picked = set()
+            for k in self.param_only_keys:
+                ln = k.split(".")[0] if "." in k else k
+                if ln in picked:
+                    noise = torch.randn_like(mstate[k].float()) * sigma
+                    mstate[k] = (mstate[k].float() + noise).to(mstate[k].dtype)
+            mutants.append(mstate)
+            mut_src.append(best_j)
 
-                bs = int(y.numel())
-                total_loss += float(loss.item()) * bs
-                total_samples += bs
-
-        if total_samples == 0:
-            try:
-                total_samples = int(len(loader.dataset))
-            except Exception:
-                total_samples = 1
-
-        return total_loss / max(1, total_samples), total_samples
+        return mutants, mut_src

@@ -55,8 +55,8 @@ def _save_checkpoint(
             "theta_base": runner.theta_base,
             "population": runner.population,
             "rng_state": runner.rng.get_state(),
-            "_delta_cache_by_cid": runner._delta_cache_by_cid,
-            "_delta_cache_fifo": runner._delta_cache_fifo,
+            "runner._delta_cache_by_cid" : {},
+            "runner._delta_cache_fifo" : [],
             "_delta_cache_max": runner._delta_cache_max,
         }
     else:
@@ -151,9 +151,9 @@ def main() -> None:
     parser.add_argument("--local_steps", type=int, default=None, help="Alias of --epochs")
     parser.add_argument("--topk_rho", type=float, default=None, help="Alias of --rho")
     parser.add_argument("--topk_gamma", type=float, default=None, help="Alias of --gamma")
-    parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
-    parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
-    parser.add_argument("--seed_group_size", type=int, default=0, help="(Not used) accepted for compatibility")
+    parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="accepted for compatibility")
+    parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="accepted for compatibility")
+    parser.add_argument("--seed_group_size", type=int, default=0, help="accepted for compatibility")
     parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg"],
                         help="Which algorithm to run")
 
