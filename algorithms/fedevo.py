@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-
-def _reset_bn_running_stats(model: nn.Module) -> None:
-    """Reset BatchNorm running stats to avoid cross-round contamination when reusing a cached model."""
-    for m in model.modules():
-        if isinstance(m, nn.modules.batchnorm._BatchNorm):
-            m.reset_running_stats()
-
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -20,6 +13,14 @@ from .base import load_state_dict_, get_state_dict, uplink_bytes_for_delta
 
 _EPS = 1e-12
 
+
+
+
+def _reset_bn_running_stats(model: nn.Module) -> None:
+    """Reset BatchNorm running stats to avoid cross-round contamination when reusing a cached model."""
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.reset_running_stats()
 
 def _clone_state(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v.detach().clone() for k, v in state.items()}
@@ -310,12 +311,12 @@ class FedEvoClient:
         return int(j_star), delta, int(n), float(train_loss)
 
 class FedEvoRunner:
-    
-    
-class FedEvoRunner:
-
-
     def _sample_two_parents(self, p):
+        """Sample two DISTINCT parent indices according to probability vector p.
+
+        Uses self.rng for reproducibility (seed_evo).
+        """
+        import numpy as np
 
         p = np.asarray(p, dtype=np.float64).copy()
         m = int(p.shape[0])
@@ -325,10 +326,12 @@ class FedEvoRunner:
         p[~np.isfinite(p)] = 0.0
         p[p < 0.0] = 0.0
         s = float(p.sum())
-        p = (np.ones(m) / m) if s <= 0.0 else (p / s)
+        p = (np.ones(m, dtype=np.float64) / m) if s <= 0.0 else (p / s)
 
-        p_idx = int(self.rng.choice(m, p=p))  # reproducible RNG
+        # sample first parent
+        p_idx = int(self.rng.choice(m, p=p))
 
+        # sample second parent without replacement
         p2 = p.copy()
         p2[p_idx] = 0.0
         s2 = float(p2.sum())
@@ -341,7 +344,6 @@ class FedEvoRunner:
 
         q_idx = int(self.rng.choice(m, p=p2))
         return p_idx, q_idx
-
 
     def __init__(
         self,
@@ -502,8 +504,6 @@ class FedEvoRunner:
 
 
         return model
-    
-    
     def run_round(
         self,
         clients: Sequence[FedEvoClient],
@@ -695,7 +695,7 @@ class FedEvoRunner:
         enable_mut_now = bool(self.ga.enable_mutation) and (int(self.round_idx) > int(self.ga.warmup_no_mut_rounds))
         mut_src: List[int] = []
         if enable_mut_now and (H < tau):
-            mutants, mut_src = self._make_mutants_from_top(theta_bars, usage_counts)
+            mutants, mut_src = self._make_mutants_from_rare(theta_bars, usage_counts)
 
             # Replace tail slots (excluding anchors 0..2) so mutants are never silently dropped.
             num_mut = min(len(mutants), max(0, m - 3))
@@ -704,7 +704,7 @@ class FedEvoRunner:
                 next_pop[s] = _clone_state(mu)
 
             if num_mut > 0:
-                print(f"[FedEvo R{self.round_idx}] mutation_from={mut_src[:num_mut]} -> slots={slots}")
+                print(f"[FedEvo R{self.round_idx}] mutation_from_rare={mut_src[:num_mut]} -> slots={slots}")
 
         self.population = next_pop
         old_base = _clone_state(self.theta_base)  # debug: keep previous base for logging
@@ -805,58 +805,84 @@ class FedEvoRunner:
         return cand
 
 
-    def _make_mutants_from_top(
+    def _make_mutants_from_rare(
         self,
         theta_bars: List[Dict[str, torch.Tensor]],
         usage_counts,
     ) -> Tuple[List[Dict[str, torch.Tensor]], List[int]]:
-        """Create mutants by copying the single most-used candidate and applying Gaussian noise.
-
-        Minimal correctness conditions (submit-safe):
-        - best_j is defined in the current round's population slot index space (argmax over usage_counts).
-        - mutant source starts from theta_bars[best_j] (post-trained) to match the intended operator.
-        - returns (mutants, mut_src) where mut_src contains source indices for logging/debug.
+        """Bottom-diversify:
+        - Choose rare candidates (least-used) from usage_counts
+        - Mutate COPIES of those rare candidates (post-trained theta_bars[j])
+        - Return mutants and their source indices for logging
         """
         if len(theta_bars) == 0:
             return [], []
         if len(usage_counts) != len(theta_bars):
-            # Defensive: keep index space consistent.
             usage_counts = list(usage_counts)[: len(theta_bars)] + [0] * max(0, len(theta_bars) - len(usage_counts))
 
-        best_j = int(np.argmax(np.asarray(usage_counts, dtype=np.int64)))
-        src = theta_bars[best_j]
+        m = len(theta_bars)
+        usage = np.asarray(usage_counts, dtype=np.int64)
 
-        # How many mutants to propose (upper-bounded later by m-3 in run_round).
-        # Use bottom_zeta as the mutation *rate* knob without changing the operator meaning.
-        num_mut = int(max(1, math.ceil(float(self.ga.bottom_zeta) * float(self.ga.m))))
+        # ---- pick rare set (bottom_zeta fraction) ----
+        zeta = float(self.ga.bottom_zeta)
+        num_rare = int(max(1, math.floor(zeta * m)))
+        order_asc = np.argsort(usage)  # least-used first
+        rare_indices = [int(j) for j in order_asc[:num_rare]]
+
+        # keep the rarest 'retain_rare_unchanged' unchanged (optional)
+        keep_k = int(max(0, self.ga.retain_rare_unchanged))
+        keep_set = set(rare_indices[:keep_k])
+
+        # how many mutants to propose (upper bounded later by m-3 in run_round)
+        # I recommend: one mutant per rare candidate (excluding kept ones)
         sigma = float(self.ga.sigma_mut)
 
-        # Build a lightweight "layer" grouping by top-level module name.
-        # This keeps mutation localized and stable across architectures.
+        # layer grouping (same as your top version)
         layer_names: List[str] = []
         for k in self.param_only_keys:
             ln = k.split(".")[0] if "." in k else k
             if ln not in layer_names:
                 layer_names.append(ln)
-        # Choose which layers to mutate (fraction) -- sampled per mutant for diversity.
+
         frac = float(self.ga.mutate_frac_layers)
         n_layers = len(layer_names)
         n_pick = int(max(1, math.ceil(frac * n_layers))) if n_layers > 0 else 0
+
         mutants: List[Dict[str, torch.Tensor]] = []
         mut_src: List[int] = []
-        for _ in range(num_mut):
-            mstate = _clone_state(src)
+
+        for j in rare_indices:
+            if j in keep_set:
+                continue
+
+            src = theta_bars[j]          # ✅ rare candidate itself (post-trained)
+            mstate = _clone_state(src)   # mutate COPY
+
             if n_layers > 0:
                 perm = torch.randperm(n_layers)
                 picked = {layer_names[int(i)] for i in perm[:n_pick].tolist()}
             else:
                 picked = set()
+
             for k in self.param_only_keys:
                 ln = k.split(".")[0] if "." in k else k
                 if ln in picked:
                     noise = torch.randn_like(mstate[k].float()) * sigma
                     mstate[k] = (mstate[k].float() + noise).to(mstate[k].dtype)
+
             mutants.append(mstate)
-            mut_src.append(best_j)
+            mut_src.append(int(j))
+
+        # Defensive: if everything got "kept unchanged", force at least 1 mutant from the rarest
+        if len(mutants) == 0 and len(rare_indices) > 0:
+            j = int(rare_indices[0])
+            src = theta_bars[j]
+            mstate = _clone_state(src)
+            # mutate all param keys lightly (fallback)
+            for k in self.param_only_keys:
+                noise = torch.randn_like(mstate[k].float()) * sigma
+                mstate[k] = (mstate[k].float() + noise).to(mstate[k].dtype)
+            mutants.append(mstate)
+            mut_src.append(j)
 
         return mutants, mut_src

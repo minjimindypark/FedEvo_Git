@@ -365,7 +365,7 @@ def generate_space(dataset: str, alpha: float, data_dir: str, rounds: int, seed_
     """
 
     # 1) local training strength: most important for sentinel survival
-    local_steps_list = [1, 2, 3]  # try small first
+    local_steps_list = [5, 8, 10]  # try small first
 
     # 2) low-sensitivity mode: bias_only first, then bias_norm
     modes = ["bias_only", "bias_norm"]
@@ -374,7 +374,7 @@ def generate_space(dataset: str, alpha: float, data_dir: str, rounds: int, seed_
     d_list = [256, 512, 768, 1024, 1536]
 
     # 4) sentinel amplitude scaling: include lower + higher
-    nu_list = [0.002, 0.005, 0.01, 0.02, 0.05, 0.08, 0.12]
+    nu_list = [0.1]
 
     out: List[TrialConfig] = []
     for steps in local_steps_list:
