@@ -141,6 +141,13 @@ def uplink_bytes_for_delta(delta: Dict[str, torch.Tensor]) -> int:
     return int(total)
 
 
+def _reset_bn_running_stats(model: nn.Module) -> None:
+    """Reset running stats of all BatchNorm layers to their initial values."""
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            m.reset_running_stats()
+
+
 @torch.no_grad()
 def bn_recalibrate(model: nn.Module, loader: DataLoader, device: torch.device, num_batches: int = 20) -> None:
     """

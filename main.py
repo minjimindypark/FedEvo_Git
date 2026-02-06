@@ -242,6 +242,14 @@ def main() -> None:
             weight_by_samples=not args.no_weight_by_samples,
             deterministic=bool(args.deterministic),
         )
+        bn_recalib_loader = make_loader(
+            bundle.train_plain_dataset,
+            batch_size=200,
+            shuffle=True,
+            seed_train=args.seed_train + 777,
+            device=device,
+        )
+        runner.set_bn_recalib_loader(bn_recalib_loader)
     # --- nice, unambiguous run header ---
     if args.algo == "fedevo":
         # ga_config는 FedEvo일 때만 존재하므로 여기에서만 사용

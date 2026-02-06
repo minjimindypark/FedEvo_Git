@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # absolute imports (works with `python3 main.py`)
-from base import load_state_dict_, get_state_dict, uplink_bytes_for_delta, _reset_bn_running_stats
+from .base import load_state_dict_, get_state_dict, uplink_bytes_for_delta, _reset_bn_running_stats
 
 _EPS = 1e-12
 
@@ -183,11 +183,23 @@ class GAConfig:
 
     # State representation
     state_mode: str = "float"
-    eval_state_mode: str = "float"
+    eval_state_mode: str = ""  # defaults to state_mode if empty
 
     # BN recalibration
     bn_recalib_enabled: bool = True
     bn_recalib_batches: int = 50
+
+    # Fields used by main.py CLI interface
+    seed_group_size: int = 0
+    rho: float = 0.3
+    gamma: float = 1.5
+    tau_factor: float = 0.8
+    num_interp: int = 4
+    num_orth: int = 1
+    enable_mutation: bool = True
+    enable_orth_injection: bool = True
+    warmup_no_orth_rounds: int = 0
+    warmup_no_mut_rounds: int = 0
 
     debug_diag: bool = True
 
@@ -340,7 +352,7 @@ class FedEvoRunner:
 
         base_model: nn.Module = model_ctor(self.num_classes).to(self.device)
         self.state_mode = str(self.ga.state_mode).lower().strip()
-        self.eval_state_mode = str(getattr(self.ga, "eval_state_mode", "float")).lower().strip() or "float"
+        self.eval_state_mode = str(getattr(self.ga, "eval_state_mode", "")).lower().strip() or self.state_mode
 
         self._bn_recalib_loader = None
         self._bn_recalib_max_batches = int(getattr(self.ga, "bn_recalib_batches", 50))
