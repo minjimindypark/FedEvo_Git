@@ -1,26 +1,20 @@
+
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base import load_state_dict_, get_state_dict, uplink_bytes_for_delta
+# absolute imports (works with `python3 main.py`)
+from base import load_state_dict_, get_state_dict, uplink_bytes_for_delta, _reset_bn_running_stats
 
 _EPS = 1e-12
 
-
-
-
-def _reset_bn_running_stats(model: nn.Module) -> None:
-    """Reset BatchNorm running stats to avoid cross-round contamination when reusing a cached model."""
-    for m in model.modules():
-        if isinstance(m, nn.modules.batchnorm._BatchNorm):
-            m.reset_running_stats()
 
 def _clone_state(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v.detach().clone() for k, v in state.items()}
@@ -56,6 +50,14 @@ def _avg_state_dicts(
     return out
 
 
+def _add_sd(base: Dict[str, torch.Tensor], delta: Dict[str, torch.Tensor], keys: List[str]) -> Dict[str, torch.Tensor]:
+    return {k: (base[k].float() + delta[k].float()).to(base[k].dtype) for k in keys}
+
+
+def _flatten(sd: Dict[str, torch.Tensor], keys: List[str]) -> torch.Tensor:
+    vecs = [sd[k].detach().float().flatten().cpu() for k in keys]
+    return torch.cat(vecs, dim=0)
+
 
 @torch.inference_mode()
 def _eval_loss_limited(
@@ -65,7 +67,6 @@ def _eval_loss_limited(
     device: torch.device,
     max_batches: Optional[int],
 ) -> float:
-    """Evaluate average cross-entropy loss on up to max_batches batches."""
     model.eval()
     total_loss = 0.0
     total_n = 0
@@ -93,6 +94,7 @@ def local_train_sgd(
     weight_decay: float,
     seed: int,
     device: torch.device,
+    clip_grad_norm: Optional[float] = None,
 ) -> Tuple[float, int]:
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
@@ -115,6 +117,8 @@ def local_train_sgd(
             logits = model(x)
             loss = F.cross_entropy(logits, y, reduction="mean")
             loss.backward()
+            if clip_grad_norm is not None and float(clip_grad_norm) > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip_grad_norm))
             opt.step()
             bs = int(y.shape[0])
             total_loss += float(loss.item()) * bs
@@ -130,65 +134,66 @@ def local_train_sgd(
     return float(total_loss / total_seen), n_k
 
 
-def _add_sd(base: Dict[str, torch.Tensor], delta: Dict[str, torch.Tensor], keys: List[str]) -> Dict[str, torch.Tensor]:
-    return {k: (base[k].float() + delta[k].float()).to(base[k].dtype) for k in keys}
-
-
-def _flatten(sd: Dict[str, torch.Tensor], keys: List[str]) -> torch.Tensor:
-    vecs = [sd[k].detach().float().flatten().cpu() for k in keys]
-    return torch.cat(vecs, dim=0)
-
-
 @dataclass
 class GAConfig:
+    # population size
     m: int = 10
-    rho: float = 0.3
-    gamma: float = 1.5
 
-    lam_low: float = 0.4
-    lam_high: float = 0.6
-    tau_factor: float = 0.8
+    # warmups (critical)
+    warmup_pop_rounds: int = 10        # collapse population to fedavg
+    warmup_no_xor_rounds: int = 50     # disable mut/orth entirely
+    warmup_no_seedfill_rounds: int = 50
+    warmup_entropy_delay: int = 50
+
+    # Selection / anchor smoothing
+    usage_ema_beta: float = 0.8
+    anti_pop_alpha: float = 1.0
+    sel_temp: float = 2.0
+    sel_weight_cap: float = 0.25
+    sel_weight_floor: float = 0.01
+
+    # FedAvg baseline / stabilizer momentum
+    server_momentum: float = 0.9
+    client_grad_clip_norm: Optional[float] = None
+
+    # XOR exploration schedule
+    xor_policy: str = "alternate"
+    entropy_low: float = 0.35
+    entropy_high: float = 0.60
+
+    # Rare/bottom selection
+    bottom_zeta: float = 0.4
+    rare_pool_min: int = 3
+
+    # Mutation operator (rare-only)
     sigma_mut: float = 0.01
     mutate_frac_layers: float = 0.33
-    bottom_zeta: float = 0.2
-    retain_rare_unchanged: int = 1
 
-    num_interp: int = 4
-    num_orth: int = 1
+    # Orth injection operator (rare-only)
+    sigma_orth: float = 0.50
+    orth_eps: float = 1e-12
 
-    use_r_parent_avg: bool = False
-    r_parent_choices: Tuple[int, ...] = (3, 4)
+    # Diversity guard
+    cos_sim_thresh: float = 0.995
+    l2_eps: float = 1e-3
+    max_resample: int = 6
 
-    enable_mutation: bool = True
-    enable_orth_injection: bool = True
-    debug_diag: bool = True
-
-    warmup_no_orth_rounds: int = 20
-    warmup_no_mut_rounds: int = 50
-
-    init_noise: float = 0.001
-    tie_eps: float = 1e-12
-    # Population seeding (paper Eq.(seed))
-    # Fill remaining slots in P(t+1) using warm cached deltas grouped by participating clients.
-    seed_group_size: int = 5
-    enable_seed_fill: bool = True
+    # Selection anti-bias
+    select_penalty_fedavg: float = 0.00
 
     # State representation
-    # - "params": trainable parameters only (θ ∈ R^P)
-    # - "float": parameters + floating buffers (e.g., BN running stats)
-    state_mode: str = "params"
+    state_mode: str = "float"
+    eval_state_mode: str = "float"
+
+    # BN recalibration
+    bn_recalib_enabled: bool = True
+    bn_recalib_batches: int = 50
+
+    debug_diag: bool = True
 
 
 @dataclass
 class FedEvoClient:
-    """A lightweight client container for simulation.
-
-    In a real FL system, the server would broadcast the population and each client
-    would locally: (1) evaluate candidates on its private validation split,
-    (2) select one candidate index, (3) fine-tune on its private training split,
-    (4) upload only (j*, delta). In this simulator we keep loaders attached to the
-    client object to avoid passing validation data through the server API.
-    """
     cid: int
     train_loader: torch.utils.data.DataLoader
     val_loader: torch.utils.data.DataLoader
@@ -203,11 +208,8 @@ class FedEvoClient:
         val_batches: Optional[int],
         tie_eps: float,
         state_mode: str,
+        penalty_by_shown_index: Optional[Dict[int, float]] = None,
     ) -> int:
-        """Client-side candidate selection (Eq. (select)).
-
-        Evaluates each candidate on the client's private validation split and returns j*.
-        """
         model = model_ctor(int(num_classes)).to(device)
         model.eval()
 
@@ -218,6 +220,8 @@ class FedEvoClient:
         for j, cand_state in enumerate(population):
             load_state_dict_(model, cand_state, mode=state_mode)
             loss = _eval_loss_limited(model, self.val_loader, device=device, max_batches=val_batches)
+            if penalty_by_shown_index is not None:
+                loss = float(loss) + float(penalty_by_shown_index.get(int(j), 0.0))
             if loss < best_loss - eps:
                 best_loss = loss
                 best_js = [int(j)]
@@ -226,8 +230,6 @@ class FedEvoClient:
 
         if len(best_js) == 0:
             return 0
-        # Deterministic tie-break (paper: epsilon-tolerant, deterministic)
-        # Choose the smallest candidate index among ties to ensure reproducibility.
         return int(min(best_js))
 
     def local_update(
@@ -243,11 +245,8 @@ class FedEvoClient:
         weight_decay: float,
         seed: int,
         state_mode: str,
+        clip_grad_norm: Optional[float] = None,
     ) -> Tuple[Dict[str, torch.Tensor], int, float]:
-        """Client-side local training and delta computation (Eq. (delta)).
-
-        Returns (delta, n_samples, avg_train_loss).
-        """
         model = model_ctor(int(num_classes)).to(device)
         load_state_dict_(model, selected_state, mode=state_mode)
 
@@ -260,14 +259,11 @@ class FedEvoClient:
             weight_decay=float(weight_decay),
             seed=int(seed),
             device=device,
+            clip_grad_norm=clip_grad_norm,
         )
 
         local_state = get_state_dict(model, mode=state_mode)
-        # Delta is w.r.t. selected candidate state
-        delta = {}
-        for k in selected_state.keys():
-            delta[k] = (local_state[k].float() - selected_state[k].float()).to(local_state[k].dtype)
-
+        delta = {k: (local_state[k].float() - selected_state[k].float()).to(local_state[k].dtype) for k in selected_state.keys()}
         return delta, int(n_samples), float(loss)
 
     def run_round(
@@ -285,8 +281,9 @@ class FedEvoClient:
         val_batches: Optional[int],
         tie_eps: float,
         state_mode: str,
+        clip_grad_norm: Optional[float] = None,
+        penalty_by_shown_index: Optional[Dict[int, float]] = None,
     ) -> Tuple[int, Dict[str, torch.Tensor], int, float]:
-        """Full client routine: select → train → return (j*, delta)."""
         j_star = self.select_best(
             population,
             model_ctor=model_ctor,
@@ -295,6 +292,7 @@ class FedEvoClient:
             val_batches=val_batches,
             tie_eps=tie_eps,
             state_mode=state_mode,
+            penalty_by_shown_index=penalty_by_shown_index,
         )
         delta, n, train_loss = self.local_update(
             population[int(j_star)],
@@ -307,44 +305,12 @@ class FedEvoClient:
             weight_decay=weight_decay,
             seed=seed,
             state_mode=state_mode,
+            clip_grad_norm=clip_grad_norm,
         )
         return int(j_star), delta, int(n), float(train_loss)
 
+
 class FedEvoRunner:
-    def _sample_two_parents(self, p):
-        """Sample two DISTINCT parent indices according to probability vector p.
-
-        Uses self.rng for reproducibility (seed_evo).
-        """
-        import numpy as np
-
-        p = np.asarray(p, dtype=np.float64).copy()
-        m = int(p.shape[0])
-        if m < 2:
-            raise ValueError(f"Need at least 2 candidates, got m={m}")
-
-        p[~np.isfinite(p)] = 0.0
-        p[p < 0.0] = 0.0
-        s = float(p.sum())
-        p = (np.ones(m, dtype=np.float64) / m) if s <= 0.0 else (p / s)
-
-        # sample first parent
-        p_idx = int(self.rng.choice(m, p=p))
-
-        # sample second parent without replacement
-        p2 = p.copy()
-        p2[p_idx] = 0.0
-        s2 = float(p2.sum())
-        if s2 <= 0.0:
-            p2 = np.ones(m, dtype=np.float64)
-            p2[p_idx] = 0.0
-            p2 /= float(p2.sum())
-        else:
-            p2 /= s2
-
-        q_idx = int(self.rng.choice(m, p=p2))
-        return p_idx, q_idx
-
     def __init__(
         self,
         model_ctor,
@@ -374,136 +340,243 @@ class FedEvoRunner:
 
         base_model: nn.Module = model_ctor(self.num_classes).to(self.device)
         self.state_mode = str(self.ga.state_mode).lower().strip()
+        self.eval_state_mode = str(getattr(self.ga, "eval_state_mode", "float")).lower().strip() or "float"
+
+        self._bn_recalib_loader = None
+        self._bn_recalib_max_batches = int(getattr(self.ga, "bn_recalib_batches", 50))
+
+        self._server_select_loader = None
+        self._server_select_max_batches = 10
+
         self.theta_base = get_state_dict(base_model, mode=self.state_mode)
 
         self.state_keys = sorted(list(self.theta_base.keys()))
         self.param_only_keys = sorted([k for k, _ in base_model.named_parameters()])
 
-        self.population: List[Dict[str, torch.Tensor]] = []
-        self.population.append(_clone_state(self.theta_base))
-        for _ in range(int(self.ga.m) - 1):
-            cand = _clone_state(self.theta_base)
-            if float(self.ga.init_noise) > 0.0:
-                self._add_param_noise_inplace(cand, sigma_scale=float(self.ga.init_noise))
-            self.population.append(cand)
-
-        self._scratch_model: nn.Module = model_ctor(self.num_classes).to(self.device)
+        self.population: List[Dict[str, torch.Tensor]] = [_clone_state(self.theta_base) for _ in range(int(self.ga.m))]
 
         self.round_idx = 0
         self.last_usage_counts: List[int] = [0] * int(self.ga.m)
         self.last_entropy: float = 0.0
 
-        # Warm-start delta cache (sentinel-free, relative to theta_base of the round they were produced in).
-        # Used for population seeding described in the paper (Eq.(seed)).
-        self._delta_cache_by_cid: Dict[int, Tuple[Dict[str, torch.Tensor], int]] = {}
-        self._delta_cache_fifo: List[Tuple[Dict[str, torch.Tensor], int]] = []
-        self._delta_cache_max: int = int(self.ga.m) * int(self.ga.seed_group_size) * 5
+        self._usage_ema = np.zeros((int(self.ga.m),), dtype=np.float64)
+        self._sel_ema = np.zeros((int(self.ga.m),), dtype=np.float64)
+        self._mom_stab: Optional[Dict[str, torch.Tensor]] = None
 
-    def _add_param_noise_inplace(self, sd: Dict[str, torch.Tensor], sigma_scale: float) -> None:
-        for k in self.param_only_keys:
-            w = sd[k]
-            std = float(w.float().std().item())
-            if not np.isfinite(std) or std <= 0.0:
-                std = 1e-4
-            sigma = float(sigma_scale) * std
-            noise = torch.randn_like(w.float()) * sigma
-            sd[k] = (w.float() + noise).to(w.dtype)
+        self.last_theta_fedavg: Optional[Dict[str, torch.Tensor]] = None
+        self.last_theta_stab: Optional[Dict[str, torch.Tensor]] = None
+        self.last_theta_used: Optional[Dict[str, torch.Tensor]] = None
+        self.last_theta_topk: Optional[Dict[str, torch.Tensor]] = None
+        self.last_theta_prev: Optional[Dict[str, torch.Tensor]] = None
 
+        self._deploy_model_cache: Optional[nn.Module] = None
+        self._deploy_model_cache_device: Optional[str] = None
+        self._deploy_model_cache_num_classes: Optional[int] = None
+
+    # -------- hooks --------
+    def set_bn_recalib_loader(self, loader, *, max_batches: Optional[int] = None) -> None:
+        self._bn_recalib_loader = loader
+        if max_batches is not None:
+            self._bn_recalib_max_batches = int(max_batches)
+
+    def set_server_select_loader(self, loader, *, max_batches: Optional[int] = None) -> None:
+        self._server_select_loader = loader
+        if max_batches is not None:
+            self._server_select_max_batches = int(max_batches)
+
+    @torch.inference_mode()
+    def _bn_recalibrate(self, model: nn.Module, *, max_batches: int) -> None:
+        if self._bn_recalib_loader is None:
+            return
+        _reset_bn_running_stats(model)
+        model.train()
+        for b_idx, (x, _) in enumerate(self._bn_recalib_loader):
+            if max_batches is not None and b_idx >= int(max_batches):
+                break
+            x = x.to(self.device, non_blocking=True)
+            _ = model(x)
+        model.eval()
+
+    # -------- safe deploy --------
+    def _get_safe_deploy_sd(self) -> Dict[str, torch.Tensor]:
+        # candidates (no test leakage): pick by server_val loss
+        cands: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+        cands.append(("fedavg", self.last_theta_fedavg or self.theta_base))
+        cands.append(("stab", self.last_theta_stab or self.theta_base))
+        cands.append(("usage", self.last_theta_used or self.theta_base))
+        cands.append(("topk", self.last_theta_topk or self.theta_base))
+        cands.append(("prev", self.last_theta_prev or self.last_theta_topk or self.theta_base))
+
+        if self._server_select_loader is None:
+            # fallback: topk
+            return self.last_theta_topk or self.theta_base
+
+        model = self.model_ctor(self.num_classes).to(self.device)
+        best_name = "topk"
+        best_loss = float("inf")
+        best_sd = self.last_theta_topk or self.theta_base
+
+        for name, sd in cands:
+            load_state_dict_(model, sd, mode=self.eval_state_mode)
+            # BN recalib if evaluating params without BN stats
+            if bool(getattr(self.ga, "bn_recalib_enabled", True)) and self.eval_state_mode == "params":
+                self._bn_recalibrate(model, max_batches=self._bn_recalib_max_batches)
+            loss = _eval_loss_limited(
+                model,
+                self._server_select_loader,
+                device=self.device,
+                max_batches=self._server_select_max_batches,
+            )
+            if loss < best_loss:
+                best_loss = loss
+                best_name = name
+                best_sd = sd
+
+        if getattr(self.ga, "debug_diag", False):
+            print(f"[SAFE DEPLOY] picked={best_name} loss={best_loss:.4f}")
+
+        return best_sd
 
     def get_deploy_model(self, policy: str = "topk") -> nn.Module:
-        """Return an nn.Module for evaluation/deployment.
+        pol = (policy or "topk").lower().strip()
 
-        IMPORTANT: main.py expects an nn.Module because bn_recalibrate/evaluate call .train()/.eval().
-
-        policy:
-          - base: theta_base
-          - stab: last stabilizer (if available)
-          - used: last usage anchor (if available)
-          - topk: last top-k aggregated candidate (default, if available)
-          - best: best post-trained candidate from last round by usage_counts
-        """
-        import numpy as _np
-
-        pol = (policy or "topk").lower()
-
-        # Choose state_dict source (ALL are sentinel-free state_dicts)
-        if pol == "base":
-            sd = self.theta_base
-        elif pol == "stab":
-            sd = getattr(self, "last_theta_stab", None) or getattr(self, "theta_stab_last", None) or self.theta_base
-        elif pol == "used":
-            sd = getattr(self, "last_theta_used", None) or getattr(self, "theta_used_last", None) or self.theta_base
-        elif pol == "topk":
-            sd = getattr(self, "last_theta_topk", None) or getattr(self, "theta_topk_last", None) or self.theta_base
-        elif pol == "best":
-            bars = getattr(self, "last_theta_bars", None) or getattr(self, "theta_bars_last", None)
-            usage = getattr(self, "last_usage_counts", None) or getattr(self, "usage_counts_last", None)
-            if bars is not None and usage is not None and len(bars) == len(usage) and len(bars) > 0:
-                j = int(_np.argmax(_np.asarray(usage, dtype=_np.int64)))
-                sd = bars[j]
-            else:
-                sd = getattr(self, "last_theta_topk", None) or getattr(self, "theta_topk_last", None) or self.theta_base
-        else:
-            sd = getattr(self, "last_theta_topk", None) or getattr(self, "theta_topk_last", None) or self.theta_base
-
-        # Reuse a cached model instance to avoid per-round construction overhead.
-
-
-        # IMPORTANT: We still (a) reset BN running stats, then (b) load the latest params each call.
-
-
-        if not hasattr(self, "_deploy_model_cache"):
-
-
-            self._deploy_model_cache = None
-
-
-            self._deploy_model_cache_num_classes = None
-
-
-            self._deploy_model_cache_device = None
-
+        if pol in ("safe", "safeguard"):
+            sd = self._get_safe_deploy_sd()
+        elif pol in ("fedavg", "fedavg_base"):
+            sd = self.last_theta_fedavg or self.theta_base
+        elif pol in ("stab", "anchor_stab"):
+            sd = self.last_theta_stab or self.theta_base
+        elif pol in ("usage", "used", "anchor_usage"):
+            sd = self.last_theta_used or self.theta_base
+        else:  # topk default
+            sd = self.last_theta_topk or self.theta_base
 
         dev_str = str(self.device)
-
-
         need_new = (
-
-
             self._deploy_model_cache is None
-
-
             or self._deploy_model_cache_num_classes != self.num_classes
-
-
             or self._deploy_model_cache_device != dev_str
-
-
         )
-
-
         if need_new:
-
-
             self._deploy_model_cache = self.model_ctor(self.num_classes).to(self.device)
-
-
             self._deploy_model_cache_num_classes = self.num_classes
-
-
             self._deploy_model_cache_device = dev_str
 
-
-        model: nn.Module = self._deploy_model_cache
-
-
-        _reset_bn_running_stats(model)
-
-
-        load_state_dict_(model, sd, mode=self.state_mode)
-
-
+        model = self._deploy_model_cache
+        load_state_dict_(model, sd, mode=self.eval_state_mode)
+        if bool(getattr(self.ga, "bn_recalib_enabled", True)) and self.eval_state_mode == "params":
+            self._bn_recalibrate(model, max_batches=self._bn_recalib_max_batches)
         return model
+
+    # -------- evo core --------
+    def _choose_xor_mode(self, *, round_idx: int, Hn: float) -> str:
+        # hard warmup: no xor
+        if int(round_idx) < int(self.ga.warmup_no_xor_rounds):
+            return "NONE"
+        pol = str(self.ga.xor_policy).lower().strip()
+        if pol == "alternate":
+            return "MUT" if (int(round_idx) % 2 == 1) else "ORTH"
+        if float(Hn) < float(self.ga.entropy_low):
+            return "ORTH"
+        if float(Hn) > float(self.ga.entropy_high):
+            return "MUT"
+        return "ORTH" if (int(round_idx) % 2 == 1) else "MUT"
+
+    def _get_rare_pool(self, usage_counts: np.ndarray) -> List[int]:
+        m = int(self.ga.m)
+        zeta = float(self.ga.bottom_zeta)
+        k = int(max(self.ga.rare_pool_min, math.ceil(zeta * m)))
+        order = np.argsort(usage_counts.astype(np.int64))
+        return [int(j) for j in order[:k]]
+
+    def _mutate_rare(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        layer_names: List[str] = []
+        for k in self.param_only_keys:
+            ln = k.split(".")[0] if "." in k else k
+            if ln not in layer_names:
+                layer_names.append(ln)
+        n_layers = len(layer_names)
+        if n_layers == 0:
+            return sd
+
+        frac = float(self.ga.mutate_frac_layers)
+        n_pick = int(max(1, math.ceil(frac * n_layers)))
+
+        picked = set()
+        perm = torch.randperm(n_layers)
+        for i in perm[:n_pick].tolist():
+            picked.add(layer_names[int(i)])
+
+        sigma = float(self.ga.sigma_mut)
+        for k in self.param_only_keys:
+            ln = k.split(".")[0] if "." in k else k
+            if ln in picked:
+                noise = torch.randn_like(sd[k].float()) * sigma
+                sd[k] = (sd[k].float() + noise).to(sd[k].dtype)
+        return sd
+
+    def _orth_inject_rare(
+        self,
+        sd: Dict[str, torch.Tensor],
+        theta_stab: Dict[str, torch.Tensor],
+        theta_bars: List[Dict[str, torch.Tensor]],
+        rare_pool: List[int],
+    ) -> Dict[str, torch.Tensor]:
+        if len(rare_pool) < 2:
+            return sd
+
+        a, b = self.rng.choice(rare_pool, size=2, replace=False).tolist()
+        va = _flatten(theta_bars[int(a)], self.param_only_keys)
+        vb = _flatten(theta_bars[int(b)], self.param_only_keys)
+        vstab = _flatten(theta_stab, self.param_only_keys)
+
+        d = (va - vb)
+        d_norm = float(torch.norm(d).item()) + float(self.ga.orth_eps)
+        s_norm = float(torch.norm(vstab).item()) + float(self.ga.orth_eps)
+
+        proj = (torch.dot(d, vstab) / (s_norm * s_norm)) * vstab
+        orth = d - proj
+        o_norm = float(torch.norm(orth).item()) + float(self.ga.orth_eps)
+
+        scale = float(self.ga.sigma_orth) * (d_norm / o_norm)
+
+        ptr = 0
+        for k in self.param_only_keys:
+            w = sd[k].detach().float().flatten().cpu()
+            n = int(w.numel())
+            chunk = orth[ptr: ptr + n]
+            ptr += n
+            w2 = (w + scale * chunk).view_as(sd[k].float())
+            sd[k] = w2.to(sd[k].dtype).to(sd[k].device)
+        return sd
+
+    def _diversity_guard(
+        self,
+        cand: Dict[str, torch.Tensor],
+        *,
+        already: List[Dict[str, torch.Tensor]],
+        resample_fn: Optional[Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        cos_thr = float(self.ga.cos_sim_thresh)
+        l2_eps = float(self.ga.l2_eps)
+        max_try = int(self.ga.max_resample)
+
+        def too_similar(x: Dict[str, torch.Tensor], y: Dict[str, torch.Tensor]) -> bool:
+            vx = _flatten(x, self.param_only_keys)
+            vy = _flatten(y, self.param_only_keys)
+            nx = float(torch.norm(vx).item()) + 1e-12
+            ny = float(torch.norm(vy).item()) + 1e-12
+            cos = float(torch.dot(vx, vy).item()) / (nx * ny)
+            l2 = float(torch.norm(vx - vy).item())
+            return (cos > cos_thr) or (l2 < l2_eps)
+
+        out = cand
+        for _ in range(max_try + 1):
+            if all(not too_similar(out, ref) for ref in already):
+                return out
+            out = resample_fn(_clone_state(out)) if resample_fn is not None else self._mutate_rare(_clone_state(out))
+        return out
+
     def run_round(
         self,
         clients: Sequence[FedEvoClient],
@@ -512,377 +585,296 @@ class FedEvoRunner:
         seed_train: int,
     ) -> Tuple[float, int]:
         lr, momentum, weight_decay = sgd_cfg
+        m = int(self.ga.m)
         self.round_idx += 1
 
-        St = list(clients)
-        m = int(self.ga.m)
+        # warmup: collapse population to base fedavg anchor
+        if int(self.round_idx) <= int(self.ga.warmup_pop_rounds):
+            self.population = [_clone_state(self.theta_base) for _ in range(m)]
 
-        deltas_by_j: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(m)]
-        samples_by_j: List[List[int]] = [[] for _ in range(m)]
+        # permutation (hidden index)
+        perm = self.rng.permutation(m).tolist()
+        inv_perm = [0] * m
+        for internal_slot, shown_pos in enumerate(perm):
+            inv_perm[int(shown_pos)] = int(internal_slot)
+
+        shown_population = [None] * m
+        for internal_slot in range(m):
+            shown_pos = perm[internal_slot]
+            shown_population[shown_pos] = self.population[internal_slot]
+
+        # selection penalty (optional)
+        penalty_by_shown_index: Dict[int, float] = {}
+        if float(self.ga.select_penalty_fedavg) > 0:
+            fedavg_shown_pos = perm[0]
+            penalty_by_shown_index[int(fedavg_shown_pos)] = float(self.ga.select_penalty_fedavg)
+
+        deltas_by_slot: List[List[Dict[str, torch.Tensor]]] = [[] for _ in range(m)]
+        samples_by_slot: List[List[int]] = [[] for _ in range(m)]
         usage_counts = np.zeros((m,), dtype=np.int64)
 
-        all_deltas_cand: List[Dict[str, torch.Tensor]] = []
         all_deltas_base: List[Dict[str, torch.Tensor]] = []
         all_samples: List[int] = []
-
         train_losses: List[float] = []
         uplink_bytes = 0
 
-        # Collect per-client deltas for warm-start cache update (used by seeding).
-        round_abs_by_cid: Dict[int, Tuple[Dict[str, torch.Tensor], int]] = {}
+        # warmup: freeze selection to fedavg slot (internal 0)
+        freeze_selection = (int(self.round_idx) <= int(self.ga.warmup_no_xor_rounds))
 
-        for client in St:
+        for client in list(clients):
             cid = int(client.cid)
 
-            # Client routine (paper Alg. 1): local selection + local training; server receives only (j*, delta).
-            j_star, delta_cand, n_samples, tr_loss = client.run_round(
-                self.population,
-                model_ctor=self.model_ctor,
-                num_classes=self.num_classes,
-                device=self.device,
-                epochs=int(epochs),
-                lr=float(lr),
-                momentum=float(momentum),
-                weight_decay=float(weight_decay),
-                seed=int(seed_train) + cid,
-                val_batches=self.val_batches,
-                tie_eps=float(self.ga.tie_eps),
-                state_mode=self.state_mode,
-            )
+            if freeze_selection:
+                shown_j = perm[0]  # shown position of internal slot 0
+                theta_selected = self.population[0]
+                # local update from theta_selected
+                delta_shown, n_samples, tr_loss = client.local_update(
+                    theta_selected,
+                    model_ctor=self.model_ctor,
+                    num_classes=self.num_classes,
+                    device=self.device,
+                    epochs=int(epochs),
+                    lr=float(lr),
+                    momentum=float(momentum),
+                    weight_decay=float(weight_decay),
+                    seed=int(seed_train) + cid,
+                    state_mode=self.state_mode,
+                    clip_grad_norm=self.ga.client_grad_clip_norm,
+                )
+            else:
+                shown_j, delta_shown, n_samples, tr_loss = client.run_round(
+                    shown_population,
+                    model_ctor=self.model_ctor,
+                    num_classes=self.num_classes,
+                    device=self.device,
+                    epochs=int(epochs),
+                    lr=float(lr),
+                    momentum=float(momentum),
+                    weight_decay=float(weight_decay),
+                    seed=int(seed_train) + cid,
+                    val_batches=self.val_batches,
+                    tie_eps=1e-12,
+                    state_mode=self.state_mode,
+                    clip_grad_norm=self.ga.client_grad_clip_norm,
+                    penalty_by_shown_index=penalty_by_shown_index if len(penalty_by_shown_index) > 0 else None,
+                )
+
             train_losses.append(float(tr_loss))
-            uplink_bytes += uplink_bytes_for_delta(delta_cand)
+            uplink_bytes += uplink_bytes_for_delta(delta_shown)
 
-            deltas_by_j[j_star].append(delta_cand)
-            samples_by_j[j_star].append(int(n_samples))
-            usage_counts[j_star] += 1
+            internal_slot = inv_perm[int(shown_j)]
+            deltas_by_slot[internal_slot].append(delta_shown)
+            samples_by_slot[internal_slot].append(int(n_samples))
+            usage_counts[internal_slot] += 1
 
-            all_deltas_cand.append(delta_cand)
-
-            delta_base = {k: (delta_cand[k].float() + (self.population[j_star][k].float() - self.theta_base[k].float())).to(delta_cand[k].dtype) for k in self.state_keys}
+            # convert to base delta
+            theta_sel = self.population[internal_slot]
+            delta_base = {k: (delta_shown[k].float() + (theta_sel[k].float() - self.theta_base[k].float())).to(delta_shown[k].dtype) for k in self.state_keys}
             all_deltas_base.append(delta_base)
             all_samples.append(int(n_samples))
-            theta_abs = {k: (self.population[j_star][k].float() + delta_cand[k].float()).to(self.population[j_star][k].dtype) for k in self.state_keys}
-            round_abs_by_cid[cid] = (theta_abs, int(n_samples))
 
-        # Update warm-start cache with latest (theta_abs, n_samples) per participating client.
-        # NOTE: We cache absolute client post-local states to avoid coordinate-frame drift when the base changes across rounds.
-        for cid, (theta_abs, n_samp) in round_abs_by_cid.items():
-            self._delta_cache_by_cid[int(cid)] = (_clone_state(theta_abs), int(n_samp))
-            self._delta_cache_fifo.append((_clone_state(theta_abs), int(n_samp)))
-        # Keep cache bounded (FIFO).
-        if self._delta_cache_max <= 0:
-            # Guard: if seed_group_size=0 (or any config yields 0), disable FIFO cache to avoid unbounded growth.
-            self._delta_cache_fifo.clear()
-        elif len(self._delta_cache_fifo) > self._delta_cache_max:
-            self._delta_cache_fifo = self._delta_cache_fifo[-self._delta_cache_max:]
+        self.last_usage_counts = [int(x) for x in usage_counts.tolist()]
 
-
-        self.last_usage_counts = usage_counts.tolist()
-
+        # theta bars per slot
         theta_bars: List[Dict[str, torch.Tensor]] = []
-        for j in range(m):
-            if len(deltas_by_j[j]) == 0:
-                theta_bars.append(_clone_state(self.population[j]))
+        for s in range(m):
+            if len(deltas_by_slot[s]) == 0:
+                theta_bars.append(_clone_state(self.population[s]))
             else:
-                if self.weight_by_samples:
-                    weights = [float(n) for n in samples_by_j[j]]
-                    avg_delta = _avg_state_dicts(deltas_by_j[j], self.state_keys, weights=weights)
-                else:
-                    avg_delta = _avg_state_dicts(deltas_by_j[j], self.state_keys, weights=None)
-                theta_bars.append(_add_sd(self.population[j], avg_delta, self.state_keys))
+                weights = [float(n) for n in samples_by_slot[s]] if self.weight_by_samples else None
+                avg_delta = _avg_state_dicts(deltas_by_slot[s], self.state_keys, weights=weights)
+                theta_bars.append(_add_sd(self.population[s], avg_delta, self.state_keys))
 
+        # entropy
         p = usage_counts.astype(np.float64)
-        s = float(p.sum())
-        if s <= 0:
-            p = np.ones((m,), dtype=np.float64) / float(m)
-        else:
-            p = p / s
+        ssum = float(p.sum())
+        p = (np.ones((m,), dtype=np.float64) / float(m)) if ssum <= 0 else (p / ssum)
         p_clip = np.clip(p, 1e-12, 1.0)
         H = float(-np.sum(p_clip * np.log(p_clip)))
+        Hmax = float(math.log(m + _EPS))
+        Hn = float(H / max(_EPS, Hmax))
         self.last_entropy = float(H)
 
-        tau = float(self.ga.tau_factor) * math.log(m + _EPS)
-
+        # base FedAvg update
         if len(all_deltas_base) == 0:
             avg_delta_base = {k: torch.zeros_like(self.theta_base[k]) for k in self.state_keys}
         else:
-            if self.weight_by_samples:
-                avg_delta_base = _avg_state_dicts(all_deltas_base, self.state_keys, weights=[float(n) for n in all_samples])
-            else:
-                avg_delta_base = _avg_state_dicts(all_deltas_base, self.state_keys, weights=None)
+            weights = [float(n) for n in all_samples] if self.weight_by_samples else None
+            avg_delta_base = _avg_state_dicts(all_deltas_base, self.state_keys, weights=weights)
+        theta_fedavg = _add_sd(self.theta_base, avg_delta_base, self.state_keys)
 
-        theta_stab = _add_sd(self.theta_base, avg_delta_base, self.state_keys)
-
-        if len(all_deltas_cand) == 0:
-            avg_delta_cand = {k: torch.zeros_like(self.theta_base[k]) for k in self.state_keys}
+        # stabilizer momentum (disabled in early warmup)
+        if int(self.round_idx) <= int(self.ga.warmup_no_xor_rounds):
+            theta_stab = _clone_state(theta_fedavg)
         else:
-            if self.weight_by_samples:
-                avg_delta_cand = _avg_state_dicts(all_deltas_cand, self.state_keys, weights=[float(n) for n in all_samples])
+            beta = float(self.ga.server_momentum)
+            if self._mom_stab is None:
+                self._mom_stab = _clone_state(theta_fedavg)
             else:
-                avg_delta_cand = _avg_state_dicts(all_deltas_cand, self.state_keys, weights=None)
+                mom = {}
+                for k in self.state_keys:
+                    mom[k] = (beta * self._mom_stab[k].float() + (1.0 - beta) * theta_fedavg[k].float()).to(theta_fedavg[k].dtype)
+                self._mom_stab = mom
+            theta_stab = _clone_state(self._mom_stab)
 
-        used_indices = [j for j in range(m) if usage_counts[j] > 0]
-        theta_used = _clone_state(theta_stab) if len(used_indices) == 0 else _avg_state_dicts([theta_bars[j] for j in used_indices], self.state_keys, weights=None)
+        # base update
+        self.theta_base = _clone_state(theta_fedavg if int(self.round_idx) <= int(self.ga.warmup_no_xor_rounds) else theta_stab)
+        warm_end = int(self.ga.warmup_no_xor_rounds)
 
-        k_star = max(1, int(math.floor(float(self.ga.rho) * m)))
-        order_desc = np.argsort(-usage_counts)
-        top_k_indices = [int(j) for j in order_desc[:k_star]]
+        # warmup 끝난 직후 1회 리셋 (round_idx == warm_end + 1)
+        if int(self.round_idx) == warm_end + 1:
+            self._usage_ema = np.zeros((m,), dtype=np.float64)
+            self._sel_ema   = np.ones((m,), dtype=np.float64) / float(m)
+            self.last_usage_counts = [0] * m
+            self.last_entropy = 0.0
 
-        w = np.power(usage_counts[top_k_indices].astype(np.float64) + 1e-8, float(self.ga.gamma))
-        w = w / (float(w.sum()) + _EPS)
+        # usage/selection EMA
+        if int(self.round_idx) > warm_end:
+            b = float(self.ga.usage_ema_beta)
+            self._usage_ema = b * self._usage_ema + (1.0 - b) * usage_counts.astype(np.float64)
+            self._sel_ema   = b * self._sel_ema   + (1.0 - b) * p.astype(np.float64)
+        else:
+            # warmup 동안은 균등 prior 유지(선택사항)
+            self._sel_ema = np.ones((m,), dtype=np.float64) / float(m)
 
-        theta_topk: Dict[str, torch.Tensor] = {}
-        for key in self.state_keys:
-            acc = torch.zeros_like(theta_bars[0][key], dtype=torch.float32)
-            for wi, j in zip(w, top_k_indices):
-                acc += float(wi) * theta_bars[j][key].float()
-            theta_topk[key] = acc.to(theta_bars[0][key].dtype)
 
-        interps: List[Dict[str, torch.Tensor]] = []
-        for _ in range(int(self.ga.num_interp)):
-            if self.ga.use_r_parent_avg:
-                r = int(self.rng.choice(list(self.ga.r_parent_choices)))
-                parents = self._sample_parents(p, r=r)
-                interps.append(_avg_state_dicts([theta_bars[j] for j in parents], self.state_keys, weights=[1.0 / r] * r))
-            else:
-                p_idx, q_idx = self._sample_two_parents(p)
-                lam = float(self.rng.uniform(self.ga.lam_low, self.ga.lam_high))
-                interps.append({k: (lam * theta_bars[p_idx][k].float() + (1.0 - lam) * theta_bars[q_idx][k].float()).to(theta_bars[p_idx][k].dtype) for k in self.state_keys})
+        # anchors: usage weighted & score weighted
+        anti = 1.0 / np.power(self._usage_ema + 1.0, float(self.ga.anti_pop_alpha))
+        w1 = anti / (float(anti.sum()) + _EPS)
+        theta_used = _avg_state_dicts([theta_bars[i] for i in range(m)], self.state_keys, weights=w1.tolist())
 
-        enable_orth_now = bool(self.ga.enable_orth_injection) and (int(self.round_idx) > int(self.ga.warmup_no_orth_rounds))
+        temp = float(self.ga.sel_temp)
+        logits = np.log(self._sel_ema + 1e-12) * temp
+        logits = logits - float(np.max(logits))
+        w2 = np.exp(logits)
+        w2 = w2 / (float(w2.sum()) + _EPS)
 
-        orths: List[Dict[str, torch.Tensor]] = []
-        if enable_orth_now and int(self.ga.num_orth) > 0:
-            stab_vec = _flatten(theta_stab, self.param_only_keys)
-            stab_norm = float(torch.norm(stab_vec).item()) + 1e-12
+        cap = float(self.ga.sel_weight_cap)
+        floor = float(self.ga.sel_weight_floor)
+        if cap > 0:
+            w2 = np.minimum(w2, cap)
+        if floor > 0:
+            w2 = np.maximum(w2, floor)
+        w2 = w2 / (float(w2.sum()) + _EPS)
 
-            for _ in range(int(self.ga.num_orth)):
-                j_perp = 0
-                min_cos = 1.0
-                for j in range(m):
-                    vec_j = _flatten(theta_bars[j], self.param_only_keys)
-                    cos = float(torch.dot(vec_j, stab_vec).item()) / (float(torch.norm(vec_j).item()) + 1e-12) / stab_norm
-                    if cos < min_cos:
-                        min_cos = cos
-                        j_perp = j
+        theta_topk = _avg_state_dicts([theta_bars[i] for i in range(m)], self.state_keys, weights=w2.tolist())
+        winner = int(np.argmax(usage_counts)) if usage_counts.size > 0 else 0
+        theta_prev = _clone_state(theta_bars[winner])
 
-                theta_orth = _add_sd(theta_bars[j_perp], avg_delta_cand, self.state_keys)
-                orths.append(theta_orth)
-
-        next_pop: List[Dict[str, torch.Tensor]] = []
-        next_pop.append(_clone_state(theta_stab))
-        next_pop.append(_clone_state(theta_used))
-        next_pop.append(_clone_state(theta_topk))
-        next_pop.extend([_clone_state(x) for x in interps])
-        next_pop.extend([_clone_state(x) for x in orths])
-
-        # Population seeding (paper Eq.(seed)): fill remaining slots using warm cached deltas grouped by clients.
-        if bool(self.ga.enable_seed_fill):
-            # Use the stabilizer as the reference base for seeding P(t+1).
-            while len(next_pop) < m and len(self._delta_cache_fifo) > 0:
-                cand = self._seed_one_candidate_from_warm_cache(base_sd=theta_stab, participants=St)
-                if cand is None:
-                    break
-                next_pop.append(cand)
-
-        while len(next_pop) < m:
-            p_idx, q_idx = self._sample_two_parents(p)
-            lam = float(self.rng.uniform(self.ga.lam_low, self.ga.lam_high))
-            next_pop.append({k: (lam * theta_bars[p_idx][k].float() + (1.0 - lam) * theta_bars[q_idx][k].float()).to(theta_bars[p_idx][k].dtype) for k in self.state_keys})
-
-        next_pop = next_pop[:m]
-
-        enable_mut_now = bool(self.ga.enable_mutation) and (int(self.round_idx) > int(self.ga.warmup_no_mut_rounds))
-        mut_src: List[int] = []
-        if enable_mut_now and (H < tau):
-            mutants, mut_src = self._make_mutants_from_rare(theta_bars, usage_counts)
-
-            # Replace tail slots (excluding anchors 0..2) so mutants are never silently dropped.
-            num_mut = min(len(mutants), max(0, m - 3))
-            slots = list(range(m - 1, m - 1 - num_mut, -1))
-            for s, mu in zip(slots, mutants[:num_mut]):
-                next_pop[s] = _clone_state(mu)
-
-            if num_mut > 0:
-                print(f"[FedEvo R{self.round_idx}] mutation_from_rare={mut_src[:num_mut]} -> slots={slots}")
-
-        self.population = next_pop
-        old_base = _clone_state(self.theta_base)  # debug: keep previous base for logging
-
-        self.theta_base = _clone_state(theta_stab)
-        # Cache round products for deployment/evaluation
-        self.last_usage_counts = [int(x) for x in usage_counts.tolist()]
-        self.last_entropy = float(H)
+        self.last_theta_fedavg = _clone_state(theta_fedavg)
         self.last_theta_stab = _clone_state(theta_stab)
         self.last_theta_used = _clone_state(theta_used)
         self.last_theta_topk = _clone_state(theta_topk)
-        self.last_theta_bars = [_clone_state(sd) for sd in theta_bars]
+        self.last_theta_prev = _clone_state(theta_prev)
 
-
-        if getattr(self.ga, "debug_diag", False):
-            stab_update_norm = float(torch.norm(_flatten(avg_delta_base, self.param_only_keys)).item())
-            cand_update_norm = float(torch.norm(_flatten(avg_delta_cand, self.param_only_keys)).item())
-            base_norm = float(torch.norm(_flatten(old_base, self.param_only_keys)).item())
-            stab_norm = float(torch.norm(_flatten(theta_stab, self.param_only_keys)).item())
-            top1 = int(np.argmax(usage_counts)) if usage_counts.size > 0 else -1
-
-            print(
-                f"[DIAG R{self.round_idx}] ||base||={base_norm:.3e} ||stab||={stab_norm:.3e} "
-                f"||avgΔ_base||={stab_update_norm:.3e} ||avgΔ_cand||={cand_update_norm:.3e} top1={top1}"
-            )
-
-        print(
-            f"[FedEvo R{self.round_idx}] H={H:.3f} (τ={tau:.3f}) usage={usage_counts.tolist()} "
-            f"orth={'Y' if enable_orth_now else 'N'} mut={'Y' if (enable_mut_now and H < tau) else 'N'}"
-        )
-
-        mean_loss = float(np.mean(train_losses)) if train_losses else 0.0
-        return mean_loss, int(uplink_bytes)
-
-    def _seed_one_candidate_from_warm_cache(
-        self,
-        *,
-        base_sd: Dict[str, torch.Tensor],
-        participants: Sequence[FedEvoClient],
-    ) -> Optional[Dict[str, torch.Tensor]]:
-        """Seed one candidate from warm cache.
-
-        NOTE: The cache stores *absolute* states (theta_abs) of past client-local models.
-        To avoid coordinate drift across rounds (changing bases), we rebase each cached
-        theta_abs into the current base: delta_curr = theta_abs - base_sd, then average
-        deltas and add back to base_sd.
-        """
-        k = int(self.ga.seed_group_size)
-        if k <= 0:
-            return None
-
-        # Pick a group of participants (prefer current round participants when possible).
-        if len(participants) > 0:
-            take = min(k, len(participants))
-            pick = self.rng.choice(len(participants), size=take, replace=False)
-            group = [participants[int(i)] for i in pick]
+        # hard warmup: keep population anchored (no explore / no xor)
+        if int(self.round_idx) <= int(self.ga.warmup_no_xor_rounds):
+            self.population = [_clone_state(theta_fedavg) for _ in range(m)]
         else:
-            group = []
+            # =================================================================
+            # FULL EVOLUTIONARY STEP (Final Production Version + NaN-safe probs)
+            # =================================================================
 
-        deltas: List[Dict[str, torch.Tensor]] = []
-        weights: List[float] = []
+            # 1. Elitism (Anchors)
+            next_pop: List[Dict[str, torch.Tensor]] = []
+            next_pop.append(_clone_state(theta_fedavg))
+            if len(next_pop) < m: next_pop.append(_clone_state(theta_stab))
+            if len(next_pop) < m: next_pop.append(_clone_state(theta_used))
+            if len(next_pop) < m: next_pop.append(_clone_state(theta_topk))
+            if len(next_pop) < m: next_pop.append(_clone_state(theta_prev))
 
-        # 1) Prefer per-client cache (cid-indexed) using current participants
-        for c in group:
-            cid = int(c.cid)
-            if cid in self._delta_cache_by_cid:
-                theta_abs, n = self._delta_cache_by_cid[cid]
-                # Rebase to current base
-                delta_curr = {
-                    key: (theta_abs[key].float() - base_sd[key].float()).to(base_sd[key].dtype)
-                    for key in self.state_keys
-                }
-                deltas.append(delta_curr)
-                weights.append(float(n))
+            # -------------------------------------------------------------
+            # 2. Crossover (Interpolation)
+            # -------------------------------------------------------------
+            num_fill = m - len(next_pop)
+            mutate_start_idx = len(next_pop)
 
-        # 2) Fallback: sample from FIFO cache if no usable per-cid entries were found
-        if len(deltas) == 0 and len(self._delta_cache_fifo) > 0:
-            take = min(k, len(self._delta_cache_fifo))
-            pick = self.rng.choice(len(self._delta_cache_fifo), size=take, replace=False)
-            for pi in pick:
-                theta_abs, n = self._delta_cache_fifo[int(pi)]
-                delta_curr = {
-                    key: (theta_abs[key].float() - base_sd[key].float()).to(base_sd[key].dtype)
-                    for key in self.state_keys
-                }
-                deltas.append(delta_curr)
-                weights.append(float(n))
+            child_parent_map: List[int] = []
 
-        if len(deltas) == 0:
-            return None
+            if num_fill > 0:
+                probs = w2.astype(np.float64)
+                probs_sum = float(probs.sum())
 
-        avg_d = _avg_state_dicts(
-            deltas,
-            self.state_keys,
-            weights=weights if bool(self.weight_by_samples) else None,
-        )
-        cand = _add_sd(_clone_state(base_sd), avg_d, self.state_keys)
-        return cand
+                # NaN/Inf/degenerate guard
+                if (not np.isfinite(probs_sum)) or probs_sum <= 0.0:
+                    probs = np.ones(m, dtype=np.float64) / float(m)
+                else:
+                    probs = probs / probs_sum
+
+                p_indices = self.rng.choice(m, size=num_fill, p=probs)
+                q_indices = self.rng.choice(m, size=num_fill, p=probs)
+
+                for i in range(num_fill):
+                    p_idx = int(p_indices[i])
+                    q_idx = int(q_indices[i])
+
+                    if p_idx == q_idx:
+                        q_idx = int(self.rng.choice(m, p=probs))
+                        if p_idx == q_idx:
+                            q_idx = int(self.rng.choice(m))
+
+                    child_parent_map.append(p_idx)
+
+                    # base = primary parent clone (keeps BN buffers)
+                    child = _clone_state(theta_bars[p_idx])
+                    sd_q  = theta_bars[q_idx]
 
 
-    def _make_mutants_from_rare(
-        self,
-        theta_bars: List[Dict[str, torch.Tensor]],
-        usage_counts,
-    ) -> Tuple[List[Dict[str, torch.Tensor]], List[int]]:
-        """Bottom-diversify:
-        - Choose rare candidates (least-used) from usage_counts
-        - Mutate COPIES of those rare candidates (post-trained theta_bars[j])
-        - Return mutants and their source indices for logging
-        """
-        if len(theta_bars) == 0:
-            return [], []
-        if len(usage_counts) != len(theta_bars):
-            usage_counts = list(usage_counts)[: len(theta_bars)] + [0] * max(0, len(theta_bars) - len(usage_counts))
+                    lam = float(self.rng.uniform(0.4, 0.6))
 
-        m = len(theta_bars)
-        usage = np.asarray(usage_counts, dtype=np.int64)
+                    for k in self.param_only_keys:
+                        # KeyError guard
+                        if k not in child or k not in sd_q:
+                            continue
+                        child[k] = (lam * child[k].float() + (1.0 - lam) * sd_q[k].float()).to(child[k].dtype)
 
-        # ---- pick rare set (bottom_zeta fraction) ----
-        zeta = float(self.ga.bottom_zeta)
-        num_rare = int(max(1, math.floor(zeta * m)))
-        order_asc = np.argsort(usage)  # least-used first
-        rare_indices = [int(j) for j in order_asc[:num_rare]]
+                    next_pop.append(child)
 
-        # keep the rarest 'retain_rare_unchanged' unchanged (optional)
-        keep_k = int(max(0, self.ga.retain_rare_unchanged))
-        keep_set = set(rare_indices[:keep_k])
+            # -------------------------------------------------------------
+            # 3. Apply XOR Strategy (Mutation vs Orth)
+            # -------------------------------------------------------------
+            xor_mode = self._choose_xor_mode(round_idx=self.round_idx, Hn=Hn)
 
-        # how many mutants to propose (upper bounded later by m-3 in run_round)
-        # I recommend: one mutant per rare candidate (excluding kept ones)
-        sigma = float(self.ga.sigma_mut)
+            rare_pool_indices = self._get_rare_pool(usage_counts)
+            rare_set = set(int(x) for x in rare_pool_indices)
 
-        # layer grouping (same as your top version)
-        layer_names: List[str] = []
-        for k in self.param_only_keys:
-            ln = k.split(".")[0] if "." in k else k
-            if ln not in layer_names:
-                layer_names.append(ln)
+            target_len = m - mutate_start_idx
+            if target_len < 0:
+                target_len = 0
 
-        frac = float(self.ga.mutate_frac_layers)
-        n_layers = len(layer_names)
-        n_pick = int(max(1, math.ceil(frac * n_layers))) if n_layers > 0 else 0
+            if len(child_parent_map) != target_len:
+                child_parent_map = [int(self.rng.choice(m)) for _ in range(target_len)]
 
-        mutants: List[Dict[str, torch.Tensor]] = []
-        mut_src: List[int] = []
+            for j in range(mutate_start_idx, m):
+                if xor_mode == "NONE":
+                    continue
 
-        for j in rare_indices:
-            if j in keep_set:
-                continue
+                rel = j - mutate_start_idx
+                if rel < 0 or rel >= len(child_parent_map):
+                    parent_idx = int(self.rng.choice(m))
+                else:
+                    parent_idx = int(child_parent_map[rel])
 
-            src = theta_bars[j]          # ✅ rare candidate itself (post-trained)
-            mstate = _clone_state(src)   # mutate COPY
+                is_parent_rare = (parent_idx in rare_set)
 
-            if n_layers > 0:
-                perm = torch.randperm(n_layers)
-                picked = {layer_names[int(i)] for i in perm[:n_pick].tolist()}
-            else:
-                picked = set()
+                apply_prob = 0.60 if is_parent_rare else 0.20
+                if self.rng.rand() < apply_prob:
+                    if xor_mode == "MUT":
+                        self._mutate_rare(next_pop[j])
+                    elif xor_mode == "ORTH":
+                        self._orth_inject_rare(
+                            sd=next_pop[j],
+                            theta_stab=theta_stab,
+                            theta_bars=theta_bars,
+                            rare_pool=rare_pool_indices,
+                        )
 
-            for k in self.param_only_keys:
-                ln = k.split(".")[0] if "." in k else k
-                if ln in picked:
-                    noise = torch.randn_like(mstate[k].float()) * sigma
-                    mstate[k] = (mstate[k].float() + noise).to(mstate[k].dtype)
+            # -------------------------------------------------------------
+            # 4. Diversity Guard
+            # -------------------------------------------------------------
+            final_pop: List[Dict[str, torch.Tensor]] = []
+            for j in range(m):
+                cand = self._diversity_guard(next_pop[j], already=final_pop)
+                final_pop.append(cand)
 
-            mutants.append(mstate)
-            mut_src.append(int(j))
-
-        # Defensive: if everything got "kept unchanged", force at least 1 mutant from the rarest
-        if len(mutants) == 0 and len(rare_indices) > 0:
-            j = int(rare_indices[0])
-            src = theta_bars[j]
-            mstate = _clone_state(src)
-            # mutate all param keys lightly (fallback)
-            for k in self.param_only_keys:
-                noise = torch.randn_like(mstate[k].float()) * sigma
-                mstate[k] = (mstate[k].float() + noise).to(mstate[k].dtype)
-            mutants.append(mstate)
-            mut_src.append(j)
-
-        return mutants, mut_src
+            self.population = final_pop
