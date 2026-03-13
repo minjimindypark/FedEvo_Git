@@ -80,8 +80,8 @@ class FedMutRunner:
         device: torch.device,
         alpha_mut: float,
         seed_mut: int,
-        mut_acc_rate: float = 0.5,   # repo args.mut_acc_rate
-        mut_bound: int = 200,        # repo args.mut_bound (early accel window)
+        mut_acc_rate: float = 0.5,   # paper: 0.3 for CNN/VGG-16, 0.5 for ResNet-18
+        mut_bound: int = 50,         # repo args.mut_bound (original: 50)
         debug: bool = False,
     ) -> None:
         self.model = model.to(device)

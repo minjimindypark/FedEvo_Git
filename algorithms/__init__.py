@@ -2,7 +2,6 @@
 
 from .base import BaseRunner, FedAvgRunner
 from .fedmut import FedMutRunner
-from .fedimpro import FedImproRunner
 from .fedevo import FedEvoRunner
 
 __all__ = [
