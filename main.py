@@ -9,6 +9,7 @@ import torch
 
 from algorithms.base import evaluate, make_loader, set_global_seed, bn_recalibrate, FedAvgRunner
 from algorithms.fedevo import FedEvoRunner, GAConfig, FedEvoClient
+from algorithms.fedmut import FedMutRunner
 from data_utils import client_train_val_split, dirichlet_partition, iid_partition, load_cifar, make_subset
 from models import ResNet18_CIFAR
 
@@ -55,8 +56,8 @@ def _save_checkpoint(
             "theta_base": runner.theta_base,
             "population": runner.population,
             "rng_state": runner.rng.get_state(),
-            "runner._delta_cache_by_cid" : {},
-            "runner._delta_cache_fifo" : [],
+            "_delta_cache_by_cid": runner._delta_cache_by_cid,
+            "_delta_cache_fifo": runner._delta_cache_fifo,
             "_delta_cache_max": runner._delta_cache_max,
         }
     else:
@@ -144,19 +145,25 @@ def main() -> None:
                         help="If >0, run BN recalibration for this many batches on train_plain before evaluation (helps when state_mode=params).")
 
     parser.add_argument("--resume", type=str, default="", help="Path to a checkpoint .pt to resume from")
-    parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N rounds (0 disables)")
+    parser.add_argument("--save_every", type=int, default=0, help="Save checkpoint every N rounds (0 disables)")
     parser.add_argument("--ckpt_dir", type=str, default="", help="Directory to save checkpoints (default: out_dir)")
 
     # aliases (optional)
     parser.add_argument("--local_steps", type=int, default=None, help="Alias of --epochs")
     parser.add_argument("--topk_rho", type=float, default=None, help="Alias of --rho")
     parser.add_argument("--topk_gamma", type=float, default=None, help="Alias of --gamma")
-    parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="accepted for compatibility")
-    parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="accepted for compatibility")
-    parser.add_argument("--seed_group_size", type=int, default=0, help="accepted for compatibility")
-    parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg"],
+    parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
+    parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
+    parser.add_argument("--seed_group_size", type=int, default=0, help="(Not used) accepted for compatibility")
+    parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg", "fedmut"],
                         help="Which algorithm to run")
+    parser.add_argument("--fedmut_radius", type=float, default=4.0, help="FedMut mutation radius (original: 4.0)")
+    parser.add_argument("--fedmut_mut_acc_rate", type=float, default=0.5, help="FedMut acceleration rate (paper: 0.5 for ResNet-18, 0.3 for CNN/VGG-16)")
+    parser.add_argument("--fedmut_mut_bound", type=int, default=50, help="FedMut mutation window (original: 50)")
 
+    # main.py (argparse 부분)
+    parser.add_argument("--adaptive_orth", action="store_true",
+                        help="Enable entropy-gated orth injection (default: off)")
 
     args = parser.parse_args()
     args.no_mutation = bool(args.no_mutation) or bool(args.no_mut)
@@ -229,7 +236,7 @@ def main() -> None:
             enable_orth_injection=not args.no_orth,
             warmup_no_orth_rounds=args.orth_warmup_rounds,
             warmup_no_mut_rounds=args.mut_warmup_rounds,
-
+            adaptive_orth=bool(args.adaptive_orth),
         )
 
         runner = FedEvoRunner(
@@ -242,14 +249,6 @@ def main() -> None:
             weight_by_samples=not args.no_weight_by_samples,
             deterministic=bool(args.deterministic),
         )
-        bn_recalib_loader = make_loader(
-            bundle.train_plain_dataset,
-            batch_size=200,
-            shuffle=True,
-            seed_train=args.seed_train + 777,
-            device=device,
-        )
-        runner.set_bn_recalib_loader(bn_recalib_loader)
     # --- nice, unambiguous run header ---
     if args.algo == "fedevo":
         # ga_config는 FedEvo일 때만 존재하므로 여기에서만 사용
@@ -259,6 +258,22 @@ def main() -> None:
             f"m={args.m} rho={args.rho} gamma={args.gamma} tau_factor={args.tau_factor} "
             f"mutation={ga_config.enable_mutation} orth={ga_config.enable_orth_injection} "
             f"state_mode={args.state_mode} bn_recalib={args.bn_recalibrate_batches}"
+        )
+    elif args.algo == "fedmut":
+        model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
+        runner = FedMutRunner(
+            model=model,
+            device=device,
+            alpha_mut=args.fedmut_radius,
+            seed_mut=args.seed_train,
+            mut_acc_rate=args.fedmut_mut_acc_rate,
+            mut_bound=args.fedmut_mut_bound,
+        )
+        print(
+            "[Run] algo=fedmut "
+            f"dataset={args.dataset} alpha={args.alpha} rounds={args.rounds} "
+            f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
+            f"radius={args.fedmut_radius} mut_acc_rate={args.fedmut_mut_acc_rate} mut_bound={args.fedmut_mut_bound}"
         )
     else:
         model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
@@ -346,6 +361,15 @@ def main() -> None:
                     seed_train=args.seed_train,
                 )
                 deploy_model = runner.get_deploy_model(policy=str(args.deploy_model))
+            elif args.algo == "fedmut":
+                train_loss, uplink_bytes = runner.run_round(
+                    client_ids=client_ids,
+                    client_train_loaders=client_train_loaders,
+                    epochs=args.epochs,
+                    sgd_cfg=(lr_current, args.momentum, args.weight_decay),
+                    seed_train=args.seed_train,
+                )
+                deploy_model = runner.model
             else:
                 train_loss, uplink_bytes = runner.run_round(
                     client_ids=client_ids,
