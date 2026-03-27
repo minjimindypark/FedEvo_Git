@@ -10,6 +10,9 @@ import torch
 from algorithms.base import evaluate, make_loader, set_global_seed, bn_recalibrate, FedAvgRunner
 from algorithms.fedevo import FedEvoRunner, GAConfig, FedEvoClient
 from algorithms.fedmut import FedMutRunner
+from algorithms.fedprox import FedProxRunner
+from algorithms.scaffold import SCAFFOLDRunner
+from algorithms.feddyn import FedDynRunner
 from data_utils import client_train_val_split, dirichlet_partition, iid_partition, load_cifar, make_subset
 from models import ResNet18_CIFAR
 
@@ -54,6 +57,7 @@ def _save_checkpoint(
             "num_classes": runner.num_classes,
             "round_idx_runner": runner.round_idx,
             "theta_base": runner.theta_base,
+            "theta_fedavg": runner.theta_fedavg,
             "population": runner.population,
             "rng_state": runner.rng.get_state(),
             "_delta_cache_by_cid": runner._delta_cache_by_cid,
@@ -108,7 +112,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=50, help="Client batch size")
     parser.add_argument("--lr", type=float, default=0.01, help="Initial learning rate")
     parser.add_argument("--momentum", type=float, default=0.9, help="SGD momentum")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay (paper default: 5e-4)")
     parser.add_argument("--lr_decay", type=float, default=0.998, help="Learning rate decay per round")
 
     parser.add_argument("--rho", type=float, default=0.3, help="Top-k selection ratio")
@@ -154,12 +158,23 @@ def main() -> None:
     parser.add_argument("--topk_gamma", type=float, default=None, help="Alias of --gamma")
     parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
     parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
-    parser.add_argument("--seed_group_size", type=int, default=0, help="(Not used) accepted for compatibility")
-    parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg", "fedmut"],
+    parser.add_argument("--seed_group_size", type=int, default=5, help="Warm-start seed group size for population seeding (GAConfig default=5; set 0 to disable)")
+    parser.add_argument("--algo", type=str, default="fedevo",
+                        choices=["fedevo", "fedavg", "fedmut", "fedprox", "scaffold", "feddyn"],
                         help="Which algorithm to run")
     parser.add_argument("--fedmut_radius", type=float, default=4.0, help="FedMut mutation radius (original: 4.0)")
     parser.add_argument("--fedmut_mut_acc_rate", type=float, default=0.5, help="FedMut acceleration rate (paper: 0.5 for ResNet-18, 0.3 for CNN/VGG-16)")
     parser.add_argument("--fedmut_mut_bound", type=int, default=50, help="FedMut mutation window (original: 50)")
+
+    # FedProx
+    parser.add_argument("--fedprox_mu", type=float, default=0.01,
+                        help="FedProx proximal term coefficient mu (paper default: 0.01)")
+
+    # FedDyn
+    parser.add_argument("--feddyn_alpha", type=float, default=0.01,
+                        help="FedDyn dynamic regularization coefficient alpha (paper default: 0.01)")
+
+    # SCAFFOLD (no extra hyperparams; uses same lr/weight_decay as others; momentum forced to 0)
 
     # main.py (argparse 부분)
     parser.add_argument("--adaptive_orth", action="store_true",
@@ -275,6 +290,51 @@ def main() -> None:
             f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
             f"radius={args.fedmut_radius} mut_acc_rate={args.fedmut_mut_acc_rate} mut_bound={args.fedmut_mut_bound}"
         )
+    elif args.algo == "fedprox":
+        model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
+        runner = FedProxRunner(
+            model=model,
+            device=device,
+            state_mode=str(args.state_mode),
+            mu=args.fedprox_mu,
+        )
+        print(
+            "[Run] algo=fedprox "
+            f"dataset={args.dataset} alpha={args.alpha} rounds={args.rounds} "
+            f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
+            f"mu={args.fedprox_mu} state_mode={args.state_mode} bn_recalib={args.bn_recalibrate_batches}"
+        )
+    elif args.algo == "feddyn":
+        model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
+        runner = FedDynRunner(
+            model=model,
+            device=device,
+            num_clients=args.num_clients,
+            state_mode=str(args.state_mode),
+            alpha=args.feddyn_alpha,
+        )
+        print(
+            "[Run] algo=feddyn "
+            f"dataset={args.dataset} alpha_data={args.alpha} rounds={args.rounds} "
+            f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
+            f"feddyn_alpha={args.feddyn_alpha} state_mode={args.state_mode} "
+            f"bn_recalib={args.bn_recalibrate_batches} (NOTE: local momentum=0 per FedDyn paper)"
+        )
+    elif args.algo == "scaffold":
+        model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
+        runner = SCAFFOLDRunner(
+            model=model,
+            device=device,
+            num_clients=args.num_clients,
+            state_mode=str(args.state_mode),
+        )
+        print(
+            "[Run] algo=scaffold "
+            f"dataset={args.dataset} alpha={args.alpha} rounds={args.rounds} "
+            f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
+            f"state_mode={args.state_mode} bn_recalib={args.bn_recalibrate_batches} "
+            f"(NOTE: local momentum=0 per SCAFFOLD paper)"
+        )
     else:
         model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
         runner = FedAvgRunner(model=model, device=device, state_mode=str(args.state_mode))
@@ -322,6 +382,34 @@ def main() -> None:
         lr_current = float(ckpt["lr_current"])
         schedule = ckpt["schedule"]
         print(f"[Resume] Loaded checkpoint={args.resume} -> start_round={r_start}, lr={lr_current:.6f}")
+
+        # ---- Restore runner state from checkpoint ----
+        if args.algo == "fedevo":
+            ev = ckpt.get("fedevo", {})
+            if ev:
+                runner.theta_base = ev["theta_base"]
+                runner.theta_fedavg = ev["theta_fedavg"]
+                runner.population = ev["population"]
+                runner.round_idx = int(ev["round_idx_runner"])
+                runner.rng.set_state(ev["rng_state"])
+                runner._delta_cache_by_cid = ev["_delta_cache_by_cid"]
+                runner._delta_cache_fifo = ev["_delta_cache_fifo"]
+                runner._delta_cache_max = int(ev["_delta_cache_max"])
+                print(f"[Resume] FedEvo state restored: runner_round={runner.round_idx}, pop_size={len(runner.population)}")
+            else:
+                raise ValueError("[Resume Error] Checkpoint missing 'fedevo' key; cannot restore FedEvo runner state.")
+        elif args.algo == "feddyn":
+            av = ckpt.get("fedavg", {})
+            if av and hasattr(runner, "model"):
+                runner.model.load_state_dict(av["model_state"])
+                print("[Resume] FedDyn model state restored. WARNING: client_h and h_global are NOT checkpointed; "
+                      "FedDyn correction vectors reset to zero. Results after resume may deviate from a full run.")
+        else:
+            # fedavg / fedprox / scaffold / fedmut — restore model weights
+            av = ckpt.get("fedavg", {})
+            if av and hasattr(runner, "model"):
+                runner.model.load_state_dict(av["model_state"])
+                print(f"[Resume] {args.algo} model state restored from checkpoint.")
 
     # Build schedule if not resumed
     if schedule is None:
@@ -371,6 +459,7 @@ def main() -> None:
                 )
                 deploy_model = runner.model
             else:
+                # fedavg / fedmut-excluded / fedprox / feddyn / scaffold share run_round(client_ids, ...) signature
                 train_loss, uplink_bytes = runner.run_round(
                     client_ids=client_ids,
                     client_train_loaders=client_train_loaders,

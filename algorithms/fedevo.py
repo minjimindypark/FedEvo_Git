@@ -136,8 +136,15 @@ class GAConfig:
     rho: float = 0.3
     gamma: float = 1.5
 
-    lam_low: float = 0.4
-    lam_high: float = 0.6
+    # [CHANGE 3] Wider interpolation range [0.2, 0.8] for more diverse crossover offspring.
+    # Original: lam_low=0.4, lam_high=0.6 (offspring always near midpoint).
+    # Motivation: under high non-IID (small alpha), restricting lambda near 0.5 produces
+    # offspring that are nearly identical to the average of two parents, providing little
+    # diversity. A wider range allows the evolutionary search to explore a broader convex
+    # hull of parent solutions.
+    lam_low: float = 0.2
+    lam_high: float = 0.8
+
     tau_factor: float = 0.8
     sigma_mut: float = 0.01
     mutate_frac_layers: float = 0.33
@@ -170,6 +177,7 @@ class GAConfig:
     # - "params": trainable parameters only (θ ∈ R^P)
     # - "float": parameters + floating buffers (e.g., BN running stats)
     state_mode: str = "params"
+
 
 
 @dataclass
@@ -430,9 +438,11 @@ class FedEvoRunner:
             round_delta_base_by_cid[cid] = (delta_base, int(n_samples))
 
         # Update warm-start cache with latest (delta_base, n_samples) per participating client.
+        # Store on CPU to avoid GPU OOM (250 entries × 44MB = 11GB on GPU otherwise).
         for cid, (d_base, n_samp) in round_delta_base_by_cid.items():
-            self._delta_cache_by_cid[int(cid)] = (_clone_state(d_base), int(n_samp))
-            self._delta_cache_fifo.append((_clone_state(d_base), int(n_samp)))
+            cpu_delta = {k: v.detach().clone().cpu() for k, v in d_base.items()}
+            self._delta_cache_by_cid[int(cid)] = (cpu_delta, int(n_samp))
+            self._delta_cache_fifo.append((cpu_delta, int(n_samp)))
         # Keep cache bounded (FIFO).
         if len(self._delta_cache_fifo) > self._delta_cache_max:
             self._delta_cache_fifo = self._delta_cache_fifo[-self._delta_cache_max :]
@@ -474,14 +484,15 @@ class FedEvoRunner:
         theta_stab = _add_sd(self.theta_base, avg_delta_base, self.state_keys)
 
         # ===== True FedAvg candidate (trajectory preserved by self.theta_fedavg) =====
-        # Reconstruct absolute local models: theta_local = theta_selected + delta(selected)
-        # Then compute delta w.r.t. theta_fedavg and apply FedAvg update on theta_fedavg.
+        # Reconstruct absolute local models: theta_local_k = population[j*_k] + delta_k
+        # Note: use self.population[j] (round-start state), NOT theta_bars[j] which already
+        # incorporates the averaged delta and would double-count it.
         all_local_states: List[Dict[str, torch.Tensor]] = []
         for j, deltas_j in enumerate(deltas_by_j):
             if len(deltas_j) == 0:
                 continue
             for d in deltas_j:
-                all_local_states.append(_add_sd(theta_bars[j], d, self.state_keys))
+                all_local_states.append(_add_sd(self.population[j], d, self.state_keys))
 
         if len(all_local_states) == 0:
             avg_delta_fedavg = {k: torch.zeros_like(self.theta_fedavg[k]) for k in self.state_keys}
@@ -570,8 +581,26 @@ class FedEvoRunner:
                 theta_orth = _add_sd(theta_bars[j_perp], avg_delta_cand, self.state_keys)
                 orths.append(theta_orth)
 
+        # [CHANGE 2] Restore theta_fedavg as the first population slot (FedAvg anchor).
+        # Motivation: including the true FedAvg trajectory candidate in the population
+        # ensures that any client can always fall back to the FedAvg-trajectory solution
+        # when no other candidate achieves lower local validation loss. This provides a
+        # convergence reference (warm-start anchor), NOT a hard performance guarantee:
+        # selection is driven by local validation loss, which may not perfectly align with
+        # global test accuracy under severe non-IID conditions.
+        # The anchor does not alter how theta_fedavg is computed (it is still maintained
+        # via the independent FedAvg trajectory update above).
+        #
+        # Population layout (m=10):
+        #   [0] theta_fedavg  <- FedAvg anchor (NEW)
+        #   [1] theta_stab
+        #   [2] theta_used
+        #   [3] theta_topk
+        #   [4-7] interp x4
+        #   [8] orth x1
+        #   [9] seed_fill or crossover x1
         next_pop: List[Dict[str, torch.Tensor]] = []
-        # next_pop.append(_clone_state(theta_fedavg)) # Always include true FedAvg candidate as an anchor option
+        next_pop.append(_clone_state(theta_fedavg))  # [CHANGE 2] FedAvg anchor
         next_pop.append(_clone_state(theta_stab))
         next_pop.append(_clone_state(theta_used))
         next_pop.append(_clone_state(theta_topk))
@@ -595,6 +624,19 @@ class FedEvoRunner:
         if enable_mut_now and (H < tau):
             next_pop = self._apply_mutation(next_pop, usage_counts)
 
+        # Capture DIAG norms BEFORE updating self.theta_base (to show prev base vs new stab)
+        if getattr(self.ga, "debug_diag", False):
+            stab_update_norm = float(torch.norm(_flatten(avg_delta_base, self.param_only_keys)).item())
+            cand_update_norm = float(torch.norm(_flatten(avg_delta_cand, self.param_only_keys)).item())
+            base_norm = float(torch.norm(_flatten(self.theta_base, self.param_only_keys)).item())
+            stab_norm = float(torch.norm(_flatten(theta_stab, self.param_only_keys)).item())
+            top1 = int(np.argmax(usage_counts)) if usage_counts.size > 0 else -1
+
+            print(
+                f"[DIAG R{self.round_idx}] ||base(t-1)||={base_norm:.3e} ||stab(t)||={stab_norm:.3e} "
+                f"||avgΔ_base||={stab_update_norm:.3e} ||avgΔ_cand||={cand_update_norm:.3e} top1={top1}"
+            )
+
         self.population = next_pop
         self.theta_base = _clone_state(theta_stab)
         self.theta_fedavg = _clone_state(theta_fedavg)
@@ -606,19 +648,6 @@ class FedEvoRunner:
         self.last_theta_used = _clone_state(theta_used)
         self.last_theta_topk = _clone_state(theta_topk)
         self.last_theta_bars = [_clone_state(sd) for sd in theta_bars]
-
-
-        if getattr(self.ga, "debug_diag", False):
-            stab_update_norm = float(torch.norm(_flatten(avg_delta_base, self.param_only_keys)).item())
-            cand_update_norm = float(torch.norm(_flatten(avg_delta_cand, self.param_only_keys)).item())
-            base_norm = float(torch.norm(_flatten(self.theta_base, self.param_only_keys)).item())
-            stab_norm = float(torch.norm(_flatten(theta_stab, self.param_only_keys)).item())
-            top1 = int(np.argmax(usage_counts)) if usage_counts.size > 0 else -1
-
-            print(
-                f"[DIAG R{self.round_idx}] ||base||={base_norm:.3e} ||stab||={stab_norm:.3e} "
-                f"||avgΔ_base||={stab_update_norm:.3e} ||avgΔ_cand||={cand_update_norm:.3e} top1={top1}"
-            )
 
         print(
             f"[FedEvo R{self.round_idx}] H={H:.3f} (τ={tau:.3f}) usage={usage_counts.tolist()} "
@@ -678,6 +707,9 @@ class FedEvoRunner:
                 avg_d = _avg_state_dicts(deltas, self.state_keys, weights=weights)
             else:
                 avg_d = _avg_state_dicts(deltas, self.state_keys, weights=None)
+            # Cache is stored on CPU; move averaged delta to device before applying.
+            target_device = next(iter(base_sd.values())).device
+            avg_d = {k: v.to(target_device) for k, v in avg_d.items()}
             cand = _add_sd(cand, avg_d, self.state_keys)
 
         # Small noise helps prevent duplicates when cache is small.

@@ -24,9 +24,16 @@ def _sd_sub(a: Mapping[str, torch.Tensor], b: Mapping[str, torch.Tensor]) -> Sta
     return {k: a[k] - b[k] for k in a.keys()}
 
 
-def _sd_avg(sds: Sequence[Mapping[str, torch.Tensor]]) -> StateDict:
+def _sd_avg(
+    sds: Sequence[Mapping[str, torch.Tensor]],
+    weights: Optional[Sequence[float]] = None,
+) -> StateDict:
     """
-    Aggregation(w_locals, None) equivalent:
+    Average state dicts.
+
+    If ``weights`` is None, this matches the official FedMut repo's
+    ``Aggregation(w_locals, None)`` behavior.
+
     - Average ONLY floating tensors.
     - For non-floating tensors (e.g., BN num_batches_tracked: int64), keep the first value.
     """
@@ -34,15 +41,23 @@ def _sd_avg(sds: Sequence[Mapping[str, torch.Tensor]]) -> StateDict:
         raise ValueError("sds is empty")
 
     keys = list(sds[0].keys())
-    m = len(sds)
+    if weights is None:
+        weights = [1.0] * len(sds)
+    if len(weights) != len(sds):
+        raise ValueError("weights and sds must have the same length")
+
+    weights_f = [float(w) for w in weights]
+    wsum = float(sum(weights_f))
+    if wsum <= 0.0:
+        raise ValueError("sum(weights) must be positive")
 
     out: StateDict = {}
     for k in keys:
         t0 = sds[0][k]
         if torch.is_floating_point(t0):
             acc = torch.zeros_like(t0)
-            for sd in sds:
-                acc += sd[k] / m
+            for sd, w in zip(sds, weights_f):
+                acc += sd[k] * (w / wsum)
             out[k] = acc
         else:
             # Keep as-is (int/bool buffers should not be averaged)
@@ -265,6 +280,7 @@ class FedMutRunner:
 
         # Train selected clients: each slot i uses its own local model state
         client_losses: List[float] = []
+        client_weights: List[float] = []
         uplink_total = 0
 
         for i, cid in enumerate(client_ids):
@@ -285,10 +301,12 @@ class FedMutRunner:
 
             self._w_locals[i] = final_sd
             client_losses.append(loss_i)
+            client_weights.append(float(len(loader.dataset)))
             uplink_total += uplink_i
 
-        # Aggregate (repo Aggregation)
-        w_glob = _sd_avg(self._w_locals)
+        # This codebase uses Dirichlet client partitions with unequal dataset sizes.
+        # Sample-weighted aggregation keeps FedMut comparable to the FedAvg baseline.
+        w_glob = _sd_avg(self._w_locals, weights=client_weights)
         self.model.load_state_dict(w_glob, strict=True)
 
         # Compute delta (repo FedSub with weight=1.0)
