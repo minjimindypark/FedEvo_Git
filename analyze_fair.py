@@ -9,10 +9,10 @@ import glob
 import pandas as pd
 import numpy as np
 
-RESULTS_DIR = "./results/fair"
+RESULTS_DIR = "./results"
 LAST_N = 50  # last 50 rounds mean (GROUND_RULES 주 지표)
 
-ALGOS  = ["fedavg", "fedmut", "fedevo_stab"]
+ALGOS  = ["fedavg", "fedmut", "fedevo_stab", "feddyn"]
 ALPHAS = ["0p1", "1", "10"]
 SEEDS  = [44, 45, 46, 47, 48]
 
@@ -44,7 +44,7 @@ for algo in ALGOS:
         })
 
 if not rows:
-    print("결과 없음 — results/fair/ 폴더를 확인하세요.")
+    print("결과 없음 — results/ 폴더를 확인하세요.")
 else:
     print(f"\n{'='*65}")
     print(f" Fair Comparison — Last {LAST_N} rounds mean accuracy")
