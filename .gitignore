@@ -1,21 +1,11 @@
-# venv / cache
 .venv/
 __pycache__/
 *.pyc
-
-# datasets / downloads
-data/
-dat/
-
-# experiment artifacts
+*.pyo
 results/
-runs/
-logs/
+data/
+*.csv
+*.ckpt
 *.pt
 *.pth
-*.ckpt
-
-# OS/editor junk
 .DS_Store
-Thumbs.db
-.vscode/
