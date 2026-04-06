@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 ALPHA_STR=$(echo "$ALPHA" | tr '.' 'p')
-OUT_DIR="./results/fair"
+OUT_DIR="./results"
 mkdir -p "$OUT_DIR"
 OUT_CSV="$OUT_DIR/fedevo_stab_cifar10_alpha${ALPHA_STR}_seed${SEED}_interpolation1.csv"
 
