@@ -10,6 +10,7 @@ import torch
 from algorithms.base import evaluate, make_loader, set_global_seed, bn_recalibrate, FedAvgRunner
 from algorithms.fedevo import FedEvoRunner, GAConfig, FedEvoClient
 from algorithms.fedmut import FedMutRunner
+from algorithms.feddyn import FedDynRunner
 from data_utils import client_train_val_split, dirichlet_partition, iid_partition, load_cifar, make_subset
 from models import ResNet18_CIFAR
 
@@ -156,11 +157,13 @@ def main() -> None:
     parser.add_argument("--orth_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
     parser.add_argument("--mut_warmup_rounds", type=int, default=0, help="(Not used) accepted for compatibility")
     parser.add_argument("--seed_group_size", type=int, default=5, help="Warm-start seed group size for population seeding (GAConfig default=5; set 0 to disable)")
-    parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg", "fedmut"],
+    parser.add_argument("--algo", type=str, default="fedevo", choices=["fedevo", "fedavg", "fedmut", "feddyn"],
                         help="Which algorithm to run")
     parser.add_argument("--fedmut_radius", type=float, default=4.0, help="FedMut mutation radius (original: 4.0)")
     parser.add_argument("--fedmut_mut_acc_rate", type=float, default=0.5, help="FedMut acceleration rate (paper: 0.5 for ResNet-18, 0.3 for CNN/VGG-16)")
     parser.add_argument("--fedmut_mut_bound", type=int, default=50, help="FedMut mutation window (original: 50)")
+    parser.add_argument("--feddyn_alpha", type=float, default=0.01,
+                        help="FedDyn dynamic regularization coefficient alpha (paper default: 0.01)")
 
     # main.py (argparse 부분)
     parser.add_argument("--adaptive_orth", action="store_true",
@@ -276,6 +279,22 @@ def main() -> None:
             f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
             f"radius={args.fedmut_radius} mut_acc_rate={args.fedmut_mut_acc_rate} mut_bound={args.fedmut_mut_bound}"
         )
+    elif args.algo == "feddyn":
+        model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
+        runner = FedDynRunner(
+            model=model,
+            device=device,
+            num_clients=args.num_clients,
+            state_mode=str(args.state_mode),
+            alpha=args.feddyn_alpha,
+        )
+        print(
+            "[Run] algo=feddyn "
+            f"dataset={args.dataset} alpha_data={args.alpha} rounds={args.rounds} "
+            f"clients_per_round={args.clients_per_round} epochs={args.epochs} "
+            f"feddyn_alpha={args.feddyn_alpha} state_mode={args.state_mode} "
+            f"bn_recalib={args.bn_recalibrate_batches} (NOTE: local momentum=0 per FedDyn paper)"
+        )
     else:
         model = ResNet18_CIFAR(int(bundle.num_classes)).to(device)
         runner = FedAvgRunner(model=model, device=device, state_mode=str(args.state_mode))
@@ -363,6 +382,15 @@ def main() -> None:
                 )
                 deploy_model = runner.get_deploy_model(policy=str(args.deploy_model))
             elif args.algo == "fedmut":
+                train_loss, uplink_bytes = runner.run_round(
+                    client_ids=client_ids,
+                    client_train_loaders=client_train_loaders,
+                    epochs=args.epochs,
+                    sgd_cfg=(lr_current, args.momentum, args.weight_decay),
+                    seed_train=args.seed_train,
+                )
+                deploy_model = runner.model
+            elif args.algo == "feddyn":
                 train_loss, uplink_bytes = runner.run_round(
                     client_ids=client_ids,
                     client_train_loaders=client_train_loaders,
