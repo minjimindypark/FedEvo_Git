@@ -40,7 +40,7 @@ python3 main.py \
   --gamma 1.5 \
   --tau_factor 0.8 \
   --sigma_mut 0.01 \
-  --num_interp 1 \
+  --num_interp 4 \
   --num_orth 1 \
   --state_mode params \
   --seed_data 42 \
